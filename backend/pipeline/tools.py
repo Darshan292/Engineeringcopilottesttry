@@ -39,6 +39,7 @@ from ..core.redaction import (
 from ..core.tokens import (
     MIN_USABLE_CONTEXT,
     build_budget,
+    estimate_tokens,
     non_chat_reason,
     suggested_models,
 )
@@ -156,23 +157,45 @@ def _preprocess(tool: str, raw: str, trace: Trace) -> tuple[str, dict, list[str]
     return safe, diagnostics, warnings
 
 
-async def _run(
+@dataclass
+class ExecutionPlan:
+    """The whole deterministic decision, made before any model is called.
+
+    Split out of `_run` so it can also be produced on its own, with no
+    upstream call, for a caller that wants to see the plan before paying for
+    it. One code path, so the preview cannot describe a plan the run would
+    not actually follow.
+    """
+
+    plan: object
+    budget: object
+    model: str
+    output_reserve: int
+    map_reserve: int
+    per_call_ceiling: int
+
+    def public(self) -> dict:
+        return {
+            "model": self.model,
+            "context": self.plan.public(),
+            "narrative": self.plan.describe(),
+            "budget": self.budget.public(),
+            "output_reserved": self.output_reserve,
+            "map_output_reserved": self.map_reserve,
+            "per_call_ceiling": self.per_call_ceiling,
+        }
+
+
+async def _plan_and_budget(
     tool: str,
     ir,
-    facts: str,
-    schema,
+    system_prompt: str,
     *,
     trace: Trace,
     model: str | None,
-    temperature: float | None,
     warnings: list[str],
-    extra_validators: list | None = None,
-    context_note: str = "",
-    client_key: str = "local",
-):
-    """Budget, plan context, then run either a single call or map-reduce."""
-    system_prompt = TOOL_PROMPTS[tool]
-
+) -> ExecutionPlan:
+    """Everything decided without the model: window, reserves, and the plan."""
     from ..config import settings
     from ..groq_client import refresh_model_registry_if_stale
 
@@ -198,12 +221,39 @@ async def _run(
             ),
         )
 
+    from ..config import output_tokens_for
+    from ..governance import token_limiter
+
+    # A flat output reservation is wasteful where it is too large and truncating
+    # where it is too small. On a hard tokens-per-minute ceiling the waste is
+    # decisive: reserving 4,096 for a reply that runs to 1,800 spends a quarter
+    # of an 8,000-token minute on nothing.
+    output_reserve = output_tokens_for(tool)
+    # A map-reduce partial answers a narrower question over a slice of the
+    # input, so it needs far less room than the final combined document.
+    map_reserve = output_tokens_for(tool, is_map_step=True)
+
     with timed(trace, "budget") as stage:
-        budget = build_budget(chosen, system_prompt, settings.max_tokens)
+        # The per-minute token allowance caps what one call can carry, whatever
+        # the context window says. Budgeting without it produces plans that the
+        # token budget then refuses -- which is what "context window too large"
+        # actually meant.
+        budget = build_budget(
+            chosen,
+            system_prompt,
+            output_reserve,
+            token_allowance_per_minute=token_limiter.per_minute,
+        )
         stage.summary = {
             "available_for_input": budget.available_for_input,
+            "effective_window": budget.effective_window,
             "window_source": budget.window_source,
+            "output_reserved": output_reserve,
         }
+
+    # `build_budget` has already folded the token allowance into the usable
+    # window, so this is the ceiling for one call.
+    per_call_ceiling = budget.available_for_input
 
     if budget.context_window < MIN_USABLE_CONTEXT:
         raise GroqError(
@@ -242,13 +292,61 @@ async def _run(
     # /api/health, for the whole duration.
     with timed(trace, "plan_context") as stage:
         plan = await asyncio.to_thread(plan_context, ir, budget)
-        stage.summary = {"strategy": plan.strategy, "chunks": len(plan.chunks)}
+        stage.summary = {
+            "strategy": plan.strategy,
+            "chunks": len(plan.chunks),
+            "effective_per_call": plan.effective_per_call,
+        }
+
+    return ExecutionPlan(
+        plan=plan,
+        budget=budget,
+        model=chosen,
+        output_reserve=output_reserve,
+        map_reserve=map_reserve,
+        per_call_ceiling=per_call_ceiling,
+    )
+
+
+async def _run(
+    tool: str,
+    ir,
+    facts: str,
+    schema,
+    *,
+    trace: Trace,
+    model: str | None,
+    temperature: float | None,
+    warnings: list[str],
+    extra_validators: list | None = None,
+    context_note: str = "",
+    client_key: str = "local",
+):
+    """Budget, plan context, then run either a single call or map-reduce."""
+    system_prompt = TOOL_PROMPTS[tool]
+
+    decided = await _plan_and_budget(
+        tool, ir, system_prompt, trace=trace, model=model, warnings=warnings
+    )
+    plan = decided.plan
+    budget = decided.budget
+    output_reserve = decided.output_reserve
+    per_call_ceiling = decided.per_call_ceiling
+    # How large a partial answer may be is the planner's decision, not a
+    # constant: it is what makes the combine tree converge, and it is what the
+    # promised call count was computed from. A runtime that uses a different
+    # number quietly makes the plan a work of fiction.
+    map_reserve = plan.map_output_tokens or decided.map_reserve
 
     if plan.strategy == "reject":
         raise GroqError(plan.reason, status=413, hint="See the reason above for the available options.")
 
     if plan.strategy != "full":
         warnings.append(plan.reason)
+
+    # The plan is part of the answer, not an implementation detail: the caller
+    # is entitled to know their input was reduced and by what rule.
+    plan_note = plan.describe()
 
     # --- single pass: full or compressed -----------------------------------
     if plan.strategy != "map_reduce":
@@ -262,13 +360,14 @@ async def _run(
                 # input's ID space would let the model cite a line it never
                 # saw, and that citation would pass the grounding check.
                 evidence_ids=chunk.item_ids,
-                context_note=context_note or (plan.reason if plan.strategy != "full" else ""),
+                context_note=plan_note,
                 warnings=warnings,
             ),
             schema,
             trace=trace,
             model=model,
             temperature=temperature,
+            max_tokens=budget.reserved_for_output,
             extra_validators=extra_validators,
             client_key=client_key,
         )
@@ -284,6 +383,15 @@ async def _run(
     accumulated: StructuredResultLike | None = None
 
     for chunk in plan.chunks:
+        # Wait for token budget rather than failing mid-run. A plan that was
+        # accepted should complete; the planner already refused anything that
+        # would wait longer than MAX_PLAN_SECONDS.
+        await _await_token_budget(
+            client_key,
+            chunk.estimated_tokens + budget.reserved_for_output,
+            trace,
+            f"part {chunk.index + 1}",
+        )
         part = await call_structured(
             system_prompt,
             build_user_message(
@@ -291,8 +399,9 @@ async def _run(
                 chunk.body,
                 evidence_ids=chunk.item_ids,
                 context_note=(
-                    f"This is part {chunk.index + 1} of {chunk.total}. Analyse only what is "
-                    f"present here; a combining step will resolve anything that spans parts."
+                    f"{plan_note}\n\nThis is part {chunk.index + 1} of {chunk.total}. Analyse "
+                    f"only what is present here; a combining step will resolve anything that "
+                    f"spans parts."
                 ),
                 warnings=warnings,
             ),
@@ -300,6 +409,7 @@ async def _run(
             trace=trace,
             model=model,
             temperature=temperature,
+            max_tokens=map_reserve,
             stage_name=f"map.part{chunk.index + 1}",
             client_key=client_key,
             # Domain validators (executing tests, validating OpenAPI) apply to
@@ -310,35 +420,132 @@ async def _run(
         cited_ids.update(_cited_ids(tool, part.value))
         accumulated = part if accumulated is None else accumulated.merge(part)
 
-    with timed(trace, "reduce") as stage:
-        stage.summary = {"parts": len(partials), "distinct_ids_cited": len(cited_ids)}
-
-    reduced = await call_structured(
-        build_reduce_system_prompt(tool),
-        build_reduce_message(
-            tool,
-            plan.skeleton,
-            partials,
-            evidence_ids=sorted(cited_ids),
-        ),
-        schema,
-        trace=trace,
-        model=model,
-        temperature=temperature,
-        stage_name="reduce",
-        extra_validators=extra_validators,
-        client_key=client_key,
+    # --- combine ------------------------------------------------------------
+    # With many parts the combined findings exceed a single call's budget on
+    # their own, so the combine is a tree: batches are merged, then the merges
+    # are merged, until one answer remains. A flat combine would either
+    # overflow the budget or silently drop partials, which is the failure this
+    # whole layer exists to prevent.
+    reduce_system = build_reduce_system_prompt(tool)
+    # From the plan, not recomputed here. The plan promised a call count based
+    # on these two numbers, and a runtime that batches by its own arithmetic
+    # makes that promise false -- which is how the preview came to advertise
+    # fourteen calls for a run that made twenty-seven.
+    reduce_ceiling = plan.reduce_ceiling or max(
+        1_000, per_call_ceiling - estimate_tokens(plan.skeleton) - 400
     )
 
+    def batches_for(items: list[str]) -> list[list[str]]:
+        """Group partials so each combine call stays inside the budget."""
+        groups: list[list[str]] = []
+        current: list[str] = []
+        used = 0
+        for item in items:
+            cost = estimate_tokens(item)
+            if current and used + cost > reduce_ceiling:
+                groups.append(current)
+                current, used = [], 0
+            current.append(item)
+            used += cost
+        if current:
+            groups.append(current)
+        return groups
+
+    level = 0
+    pending = partials
+    reduced = None
+
+    while True:
+        groups = batches_for(pending)
+        level += 1
+
+        with timed(trace, f"reduce.level{level}") as stage:
+            stage.summary = {
+                "inputs": len(pending),
+                "batches": len(groups),
+                "distinct_ids_cited": len(cited_ids),
+            }
+
+        if len(groups) == 1:
+            reduced = await call_structured(
+                reduce_system,
+                build_reduce_message(tool, plan.skeleton, groups[0], evidence_ids=sorted(cited_ids)),
+                schema,
+                trace=trace,
+                model=model,
+                temperature=temperature,
+                max_tokens=output_reserve,
+                stage_name="reduce.final",
+                extra_validators=extra_validators,
+                client_key=client_key,
+            )
+            break
+
+        if level > 4:  # pathological input; stop rather than loop
+            raise GroqError(
+                f"Combining {len(partials)} partial analyses did not converge within 4 levels.",
+                status=413,
+                hint=(
+                    "Narrow the input, or raise TOKEN_LIMIT_PER_MINUTE so the analysis needs "
+                    "fewer parts."
+                ),
+            )
+
+        merged: list[str] = []
+        for index, group in enumerate(groups, start=1):
+            partial = await call_structured(
+                reduce_system,
+                build_reduce_message(tool, plan.skeleton, group, evidence_ids=sorted(cited_ids)),
+                schema,
+                trace=trace,
+                model=model,
+                temperature=temperature,
+                max_tokens=map_reserve,
+                stage_name=f"reduce.L{level}.batch{index}",
+                client_key=client_key,
+            )
+            merged.append(partial.value.model_dump_json(indent=None))
+            accumulated = partial if accumulated is None else accumulated.merge(partial)
+        pending = merged
+
     warnings.append(
-        f"This input was analysed in {len(plan.chunks)} parts and then combined "
-        f"({len(plan.chunks) + 1} model calls). No single call saw the whole input, so "
+        f"This input was analysed in {len(plan.chunks)} parts and combined over {level} "
+        f"level(s), {trace.upstream_calls} model calls in total. No single call saw the "
+        f"whole input, so "
         f"relationships spanning parts rest on the combining step rather than on direct "
         f"observation. Confidence is reduced accordingly."
     )
 
     final = accumulated.merge(reduced) if accumulated else reduced
     return final, plan
+
+
+async def _await_token_budget(client_key: str, needed: int, trace: Trace, label: str) -> None:
+    """Block until the token allowance can carry `needed`, or give up cleanly.
+
+    A multi-call plan that starts and then dies half way through has spent real
+    quota for nothing. Waiting keeps the run whole; the planner has already
+    refused plans whose total wait would be unreasonable.
+    """
+    from ..governance import token_limiter
+
+    deadline = asyncio.get_running_loop().time() + 300
+    waited = 0.0
+    while True:
+        allowed, _reason, retry_after = token_limiter.check(client_key, needed)
+        if allowed:
+            if waited:
+                trace.record(f"paced.{label}", asyncio.get_running_loop().time() - waited, {"waited_s": round(waited, 1)})
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise GroqError(
+                f"Gave up waiting for token budget before {label}.",
+                status=429,
+                hint="Raise TOKEN_LIMIT_PER_MINUTE, or narrow the input so fewer calls are needed.",
+            )
+        pause = min(max(1, retry_after), 15)
+        waited += pause
+        await asyncio.sleep(pause)
 
 
 def _cited_ids(tool: str, value) -> set[str]:
@@ -659,4 +866,158 @@ PIPELINES = {
     "api-docs": run_api_docs,
     "log-rca": run_log_rca,
     "postmortem": run_postmortem,
+}
+
+
+# --- plan preview ---------------------------------------------------------
+#
+# The same deterministic front half, run on its own with no upstream call.
+#
+# It exists because "how is this being split, and why" is a question the caller
+# should be able to ask before spending quota, not only read afterwards in a
+# diagnostics panel. Answering it from a separate estimator would be worse than
+# not answering it: a preview that disagrees with the run is a lie with a
+# progress bar. So this calls the same parsers and the same planner, and the
+# only thing it leaves out is the model.
+
+
+_PARSERS = {
+    "log-rca": lambda safe: parse_logs(safe),
+    "postmortem": lambda safe: parse_transcript(safe),
+    "unit-tests": lambda safe: parse_code(safe, detect_language(safe).value),
+    "api-docs": lambda safe: parse_routes(safe),
+}
+
+# What each tool's deterministic stages extracted, in the caller's language.
+# The point of the preview is to show that real work happens before the model
+# is involved; "parsed 2,318 lines into 41 message patterns" makes that
+# concrete in a way that "preprocessing complete" does not.
+_EXTRACTION_SUMMARY = {
+    "log-rca": lambda ir: [
+        f"{ir.total_lines:,} log lines parsed and given stable IDs",
+        f"{len(ir.templates):,} distinct message patterns mined by variable masking",
+        f"{ir.stats()['parse_rate']:.0%} of lines matched a known timestamp/level format",
+    ],
+    "postmortem": lambda ir: [
+        f"{len(ir.utterances):,} speaker turns parsed",
+        f"{len(ir.speakers):,} participants found and replaced with role placeholders",
+    ],
+    "unit-tests": lambda ir: [
+        f"language detected as {ir.language} (parser: {ir.parser})",
+        f"{len(ir.all_functions()):,} functions and methods extracted",
+        f"{sum(len(f.comparisons) for f in ir.all_functions()):,} boundary comparisons extracted from branches",
+        f"{sum(len(f.raises) for f in ir.all_functions()):,} explicit raise sites found",
+        f"{sum(len(f.external_calls) for f in ir.all_functions()):,} external calls that will need mocking",
+    ],
+    "api-docs": lambda ir: [
+        f"framework detected as {ir.framework} (parser: {ir.parser})",
+        f"{len(ir.routes):,} routes extracted",
+        f"{len(ir.models):,} request/response schemas found",
+    ],
+}
+
+
+async def preview(tool: str, raw: str, *, model=None, request_id=None) -> dict:
+    """Run everything up to the model call and report what would happen.
+
+    Costs no tokens and makes no upstream request beyond the hourly model
+    metadata refresh, which is cached.
+    """
+    trace = Trace(request_id or uuid.uuid4().hex[:12])
+    warnings: list[str] = []
+
+    safe, diagnostics, warnings = await _preprocess_async(tool, raw, trace)
+
+    with timed(trace, "parse") as stage:
+        ir = await asyncio.to_thread(_PARSERS[tool], safe)
+        stage.summary = {"kind": type(ir).__name__}
+    diagnostics["parse"] = ir.stats()
+
+    decided = await _plan_and_budget(
+        tool, ir, TOOL_PROMPTS[tool], trace=trace, model=model, warnings=warnings
+    )
+    plan = decided.plan
+
+    # A plan that would be refused is reported as a plan, not raised as an
+    # error: the caller asked what would happen, and "it would be refused,
+    # here is the arithmetic" is the answer.
+    steps = _preview_steps(tool, plan)
+
+    return {
+        "tool": tool,
+        "request_id": trace.request_id,
+        "feasible": plan.strategy != "reject",
+        "extracted": _EXTRACTION_SUMMARY[tool](ir),
+        "steps": steps,
+        "warnings": warnings,
+        "diagnostics": diagnostics,
+        **decided.public(),
+    }
+
+
+def _preview_steps(tool: str, plan) -> list[dict]:
+    """The ordered work, deterministic stages and model calls alike.
+
+    Both are listed because both are real work, and showing only the model
+    calls would reproduce exactly the impression this architecture exists to
+    correct -- that the answer is what the model said.
+    """
+    steps: list[dict] = [
+        {"kind": "deterministic", "name": "Redact secrets", "detail": "~20 credential patterns, before anything leaves this process"},
+        {"kind": "deterministic", "name": "Scan for prompt injection", "detail": "instruction-shaped text in the input is neutralised, not obeyed"},
+        {"kind": "deterministic", "name": "Parse to structured facts", "detail": "stable IDs assigned so every later claim can be checked against one"},
+        {"kind": "deterministic", "name": "Plan the context", "detail": plan.reason},
+    ]
+
+    if plan.strategy == "reject":
+        steps.append({"kind": "blocked", "name": "Refused", "detail": plan.reason})
+        return steps
+
+    if plan.strategy == "map_reduce":
+        for chunk in plan.chunks:
+            steps.append({
+                "kind": "model",
+                "name": f"Analyse part {chunk.index + 1} of {chunk.total}",
+                "detail": (
+                    f"{len(chunk.item_ids):,} items ({chunk.item_ids[0] if chunk.item_ids else '?'}"
+                    f"..{chunk.item_ids[-1] if chunk.item_ids else '?'}), "
+                    f"~{chunk.estimated_tokens:,} tokens, carrying the global overview"
+                ),
+            })
+        # The combine is a tree when the partials do not fit one call together,
+        # so every round is listed. Showing one step for what is really a dozen
+        # calls is the same lie as showing one call for a dozen parts.
+        combine_calls = plan.estimated_calls - len(plan.chunks)
+        for index in range(combine_calls):
+            final = index == combine_calls - 1
+            steps.append({
+                "kind": "model",
+                "name": "Combine the partial findings" if final else f"Merge partial findings ({index + 1})",
+                "detail": (
+                    "reasons over every part's findings plus the overview; may cite only what the parts cited"
+                    if final
+                    else "a batch of partial answers merged into one, because they do not fit a single combine call"
+                ),
+            })
+    else:
+        steps.append({
+            "kind": "model",
+            "name": "Analyse",
+            "detail": f"one call, ~{plan.estimated_input_tokens:,} input tokens ({plan.strategy})",
+        })
+
+    steps += [
+        {"kind": "deterministic", "name": "Verify every citation exists", "detail": "claims citing an ID that was never sent are dropped, not rendered"},
+        {"kind": "deterministic", "name": "Run the domain validators", "detail": _VALIDATOR_BLURB[tool]},
+        {"kind": "deterministic", "name": "Compute confidence", "detail": "from measured signals -- grounding ratio, parse rate, strategy, contradictions -- not from the model's own estimate"},
+        {"kind": "deterministic", "name": "Render", "detail": "from validated structures, so an unverified response has nothing to render from"},
+    ]
+    return steps
+
+
+_VALIDATOR_BLURB = {
+    "unit-tests": "the generated tests are executed with pytest in a sandbox; failures are reported, not hidden",
+    "api-docs": "the OpenAPI document is schema-validated offline and cross-checked against the parsed routes",
+    "log-rca": "timeline ordering and evidence-per-claim are checked against the parsed log",
+    "postmortem": "every name is checked against the allowed role placeholders; invented names are rejected",
 }

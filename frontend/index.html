@@ -59,6 +59,7 @@
           <span id="run-label">Run</span>
           <kbd>⌘↵</kbd>
         </button>
+        <button class="btn" id="plan-btn" type="button" title="Show how this input will be split and processed. Costs nothing.">Plan</button>
         <button class="btn" id="sample-btn" type="button" title="Load a realistic sample input">Load sample</button>
         <button class="btn btn-quiet" id="clear-btn" type="button">Clear</button>
       </div>
@@ -77,6 +78,15 @@
         <button class="btn btn-quiet" id="download-btn" type="button" disabled>Download .md</button>
       </div>
     </div>
+
+    <section id="plan-panel" class="plan-panel" hidden aria-label="Execution plan">
+      <div class="plan-head">
+        <h3 id="plan-title">Execution plan</h3>
+        <span class="plan-cost" id="plan-cost"></span>
+        <button class="icon-btn" id="plan-toggle" type="button" aria-expanded="true" title="Collapse">&minus;</button>
+      </div>
+      <div id="plan-body" class="plan-body"></div>
+    </section>
 
     <div id="warnings" class="warnings" hidden></div>
 

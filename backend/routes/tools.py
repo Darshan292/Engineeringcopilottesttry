@@ -25,7 +25,7 @@ from ..governance import (
     token_limiter,
 )
 from ..groq_client import GroqError, list_models
-from ..pipeline.tools import PIPELINES
+from ..pipeline.tools import PIPELINES, preview
 from ..samples import SAMPLES
 from ..schemas import ErrorResponse, ToolRequest, ToolResponse
 
@@ -161,6 +161,47 @@ async def log_rca(request: Request, body: ToolRequest, authorization: str | None
 async def postmortem(request: Request, body: ToolRequest, authorization: str | None = Header(default=None)):
     """Anonymize a transcript, then draft a blameless postmortem from it."""
     return await _handle("postmortem", request, body, authorization)
+
+
+@router.post("/plan/{tool_id}", responses={404: {"model": ErrorResponse}, 422: {"model": ErrorResponse}})
+async def plan(tool_id: str, request: Request, body: ToolRequest, authorization: str | None = Header(default=None)):
+    """What the pipeline would do with this input, without doing it.
+
+    No model call, no token spend. It exists so the caller can see how their
+    input will be split, what the deterministic stages already extracted, and
+    what the run will cost, before deciding to pay for it.
+
+    It runs the real parsers and the real planner rather than an estimator,
+    because a preview that can disagree with the run is worse than no preview.
+    """
+    request_id = uuid.uuid4().hex[:12]
+    if tool_id not in PIPELINES:
+        raise HTTPException(status_code=404, detail=f"No tool '{tool_id}'.")
+
+    try:
+        auth_policy.check(authorization)
+        model = model_policy.check_model(body.model, settings.groq_model)
+        # Planning is local work, so it does not spend the token allowance --
+        # but it is not free CPU, and an unlimited planning endpoint is a way to
+        # burn the process without ever touching the provider.
+        enforce_rate_limit(_client_key(request))
+    except GovernanceError as exc:
+        return _error(exc.message, exc.status, exc.hint, request_id, exc.headers)
+
+    try:
+        result = await preview(tool_id, body.input, model=model, request_id=request_id)
+    except GroqError as exc:
+        return _error(exc.message, exc.status, exc.hint, request_id)
+    except Exception as exc:  # pragma: no cover - last-resort guard
+        log.exception("rid=%s tool=%s preview failed", request_id, tool_id)
+        return _error(
+            f"Unexpected error planning {tool_id}: {type(exc).__name__}",
+            500,
+            "This is a bug. The request ID appears in the server log next to the traceback.",
+            request_id,
+        )
+
+    return JSONResponse(content=result, headers={"X-Request-ID": request_id})
 
 
 # --- introspection --------------------------------------------------------

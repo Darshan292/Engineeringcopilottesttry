@@ -616,3 +616,224 @@ body {
 .budget[hidden] { display: none; }
 .budget-low { color: var(--warn); }
 .budget-out { color: var(--bad); }
+
+/* --- execution plan -------------------------------------------------------
+ *
+ * Deliberately styled as a document rather than a dashboard. The panel's job
+ * is to be read once, before a run, and then referred back to -- not to convey
+ * live state it does not have. Local stages and model calls are given the same
+ * visual weight, because the whole point is that most of the work is not the
+ * model.
+ */
+
+.plan-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  margin: 0 0 12px;
+  overflow: hidden;
+}
+
+.plan-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.plan-head h3 {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.plan-cost {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  text-align: right;
+}
+
+.plan-body {
+  padding: 12px;
+}
+
+.plan-body[hidden] {
+  display: none;
+}
+
+.plan-why {
+  margin: 0 0 12px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 0 4px 4px 0;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.55;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+}
+
+.plan-extracted h4 {
+  margin: 0 0 6px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+.plan-extracted ul {
+  margin: 0 0 14px;
+  padding-left: 18px;
+  font-size: 0.78rem;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+
+.plan-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: plan;
+}
+
+.plan-step {
+  display: grid;
+  grid-template-columns: 52px 1fr auto;
+  gap: 2px 10px;
+  align-items: baseline;
+  padding: 7px 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.plan-step:first-child {
+  border-top: 0;
+}
+
+.plan-badge {
+  grid-row: span 2;
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  text-align: center;
+  padding: 2px 0;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--text-faint);
+}
+
+.plan-model .plan-badge {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.plan-blocked .plan-badge {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+.plan-name {
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+
+.plan-blocked .plan-name {
+  color: var(--bad);
+}
+
+.plan-ms {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  color: var(--good);
+}
+
+.plan-detail {
+  grid-column: 2 / -1;
+  font-size: 0.73rem;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+
+.plan-running {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 14px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  font-size: 0.78rem;
+  color: var(--text-dim);
+}
+
+@media (max-width: 720px) {
+  .plan-step {
+    grid-template-columns: 44px 1fr;
+  }
+
+  .plan-ms {
+    grid-column: 2;
+  }
+}
+
+/* ---------- narrow viewports ----------
+ *
+ * A flex item's default `min-width: auto` refuses to shrink below its content,
+ * so the tab strip and the model chip pushed the whole document wider than the
+ * viewport and every pane inherited a horizontal scrollbar. Setting an explicit
+ * minimum lets them shrink, and `overflow-x: auto` on the strip then does what
+ * it was always meant to do: scroll itself rather than the page.
+ */
+
+@media (max-width: 620px) {
+  .topbar {
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px 14px;
+  }
+
+  .topbar-right {
+    width: 100%;
+    justify-content: space-between;
+    min-width: 0;
+  }
+
+  .model-chip {
+    min-width: 0;
+    flex: 1 1 auto;
+    max-width: none;
+  }
+
+  .model-chip #model-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tabs {
+    min-width: 0;
+    padding: 0 14px;
+    scrollbar-width: none;
+  }
+
+  .tabs::-webkit-scrollbar {
+    display: none;
+  }
+
+  .tab {
+    flex: 0 0 auto;
+  }
+
+  .warnings,
+  .pane-head,
+  .pane-foot {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+}

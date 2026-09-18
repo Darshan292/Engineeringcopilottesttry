@@ -283,12 +283,72 @@ class TokenBudgetLimiter:
         return True, "", 0
 
     def record(self, client: str, tokens: int) -> None:
+        """Charge `tokens` to the window with no intention of correcting it."""
         if tokens <= 0:
             return
         now = time.time()
         with self._lock:
-            self._minute[client].append((now, tokens))
-            self._day[client].append((now, tokens))
+            self._minute[client].append([now, tokens])
+            self._day[client].append([now, tokens])
+
+    def reserve(self, client: str, tokens: int) -> list | None:
+        """Claim `tokens` now, returning a handle to settle against the truth.
+
+        The claim has to happen before the call, not after: two requests that
+        both check a stale window both pass, and the provider then refuses the
+        second with a limit the application never saw. So the estimate is
+        charged up front and corrected when the real figure arrives.
+        """
+        if tokens <= 0:
+            return None
+        now = time.time()
+        entry = [now, tokens]
+        with self._lock:
+            self._minute[client].append(entry)
+            self._day[client].append(entry)
+        return entry
+
+    def settle(self, handle: list | None, actual_tokens: int) -> None:
+        """Replace a reservation with what the call actually cost.
+
+        A reservation is a deliberate over-estimate: the full output allowance
+        is claimed because the real output length is unknowable until the
+        response arrives. Leaving that over-estimate in the window burns
+        allowance nobody spent -- on an 8,000-token minute, reserving 2,600 for
+        an answer that ran to 1,200 quietly costs the next call its place, and
+        a seven-part analysis loses most of a call's worth of budget to
+        arithmetic that was never true.
+
+        An entry already trimmed out of the window is left alone: it has
+        expired, and reviving it would charge a minute that has passed.
+        """
+        if handle is None:
+            return
+        with self._lock:
+            handle[1] = max(0, actual_tokens)
+
+    def wait_needed(self, client: str, estimated_tokens: int) -> float:
+        """Seconds until a request of this size would fit. 0 if it fits now.
+
+        Returns -1 when it can never fit, because the request alone exceeds a
+        whole window -- waiting would not help and the caller must be told to
+        shrink the request instead.
+        """
+        if self.per_minute and estimated_tokens > self.per_minute:
+            return -1.0
+        now = time.time()
+        with self._lock:
+            minute, _ = self._trim(client, now)
+            used = sum(t for _, t in minute)
+            if not self.per_minute or used + estimated_tokens <= self.per_minute:
+                return 0.0
+            # Retiring entries from the front of the window frees their tokens.
+            freed = 0
+            for timestamp, tokens in minute:
+                freed += tokens
+                if used - freed + estimated_tokens <= self.per_minute:
+                    return max(0.0, 60.0 - (now - timestamp)) + 0.5
+        return 60.0
 
     def snapshot(self, client: str) -> dict:
         remaining_minute, remaining_day = self.remaining(client)
@@ -307,6 +367,74 @@ token_limiter = TokenBudgetLimiter(
     per_minute=_env_int("TOKEN_LIMIT_PER_MINUTE", 8_000),
     per_day=_env_int("TOKEN_LIMIT_PER_DAY", 200_000),
 )
+
+# Waiting for budget beats failing. A free-tier ceiling means a multi-part
+# analysis genuinely takes minutes, and a result that arrives slowly is worth
+# more than a 429 that arrives quickly. Bounded so a request cannot hang
+# forever, and every wait is reported.
+WAIT_FOR_TOKEN_BUDGET = _env_bool("WAIT_FOR_TOKEN_BUDGET", True)
+MAX_TOTAL_WAIT_SECONDS = _env_int("MAX_TOTAL_WAIT_SECONDS", 600)
+
+
+async def await_token_budget(
+    client: str,
+    estimated_tokens: int,
+    *,
+    stage: str,
+    waited_so_far: float = 0.0,
+) -> tuple[float, list | None]:
+    """Block until `estimated_tokens` fit, or raise.
+
+    Returns (seconds waited, reservation handle). The handle must be settled
+    with the call's real token usage; see `TokenBudgetLimiter.settle`.
+
+    Every path reserves. The non-waiting path used to check and return without
+    charging anything, on the assumption that the caller would record the usage
+    afterwards -- but the caller only recorded the difference against a
+    reservation that was never made, so with WAIT_FOR_TOKEN_BUDGET off the
+    limiter accumulated nothing and let every repair through. A limiter that
+    silently stops limiting is worse than no limiter, because the refusal it
+    was there to produce now comes from the provider instead.
+    """
+    if not WAIT_FOR_TOKEN_BUDGET:
+        enforce_token_budget(client, estimated_tokens, stage=stage)
+        return 0.0, token_limiter.reserve(client, estimated_tokens)
+
+    wait = token_limiter.wait_needed(client, estimated_tokens)
+
+    if wait < 0:
+        raise GovernanceError(
+            f"A single call for {stage} needs about {estimated_tokens:,} tokens, more than the "
+            f"entire {token_limiter.per_minute:,}-token minute allowance. Waiting cannot help.",
+            status=413,
+            hint=(
+                "Paste a smaller excerpt, or use a model with a higher token allowance. "
+                "Raise TOKEN_LIMIT_PER_MINUTE if your account permits more than this "
+                "deployment assumes."
+            ),
+        )
+
+    if wait == 0:
+        return 0.0, token_limiter.reserve(client, estimated_tokens)
+
+    if waited_so_far + wait > MAX_TOTAL_WAIT_SECONDS:
+        raise GovernanceError(
+            f"Completing this request would need another {wait:.0f}s of waiting for token "
+            f"budget, past the {MAX_TOTAL_WAIT_SECONDS}s limit for one request "
+            f"({waited_so_far:.0f}s already spent waiting).",
+            status=429,
+            hint=(
+                "The analysis was split into more parts than this minute's allowance can "
+                "carry. Narrow the input, raise MAX_TOTAL_WAIT_SECONDS, or use a model with "
+                "a higher token allowance."
+            ),
+            headers={"Retry-After": str(int(wait))},
+        )
+
+    await asyncio.sleep(wait)
+    # Reserve immediately so concurrent requests cannot both claim the freed
+    # budget; the real usage replaces this reservation once the call returns.
+    return wait, token_limiter.reserve(client, estimated_tokens)
 
 
 def _parse_limit_header(value: str | None) -> int | None:

@@ -272,25 +272,59 @@ def test_input_beyond_the_absolute_backstop_is_rejected_clearly(client):
     assert "limit" in res.json()["error"].lower()
 
 
-def test_input_that_cannot_fit_is_refused_with_a_remedy(client, for_tool, monkeypatch):
-    """Silently analysing 3% of a log is worse than refusing."""
-    from backend.core import chunking
-
-    monkeypatch.setattr(chunking, "DEFAULT_MAX_CHUNKS", 2)
-    for_tool("log-rca")
-
-    # A window that is usable in principle but far too small for this input.
-    # Below MIN_USABLE_CONTEXT it would be refused as an unusable model instead,
-    # which is a different (also correct) path covered elsewhere.
+def test_a_huge_log_on_a_tiny_budget_is_selected_not_refused(client, for_tool, monkeypatch):
+    """Relevance selection handles what used to need chunking or a refusal."""
     from backend.core import tokens
 
     monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 8_000)
     monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
+    stub = for_tool("log-rca")
 
     res = client.post("/api/log-rca", json={"input": _repetitive_log(20_000)})
+    assert res.status_code == 200, res.text
+
+    body = res.json()
+    stages = {s["name"]: s for s in body["trace"]["stages"]}
+    assert stages["plan_context"]["strategy"] == "selected"
+    # One call, not N+1, and the whole input is still accounted for.
+    assert stub.call_count == 1
+    assert body["diagnostics"]["parse"]["total_lines"] == 20_000
+    assert any("selected by relevance score" in w for w in body["warnings"])
+    # The model is told it is looking at a subset.
+    assert "deterministic relevance score" in stub.last_user_content
+    # And confidence reflects the partial view.
+    assert body["diagnostics"]["confidence"]["computed_score"] < 0.9
+
+
+def test_a_plan_that_would_take_too_long_is_refused_with_the_arithmetic(client, for_tool, monkeypatch):
+    """Minutes of waiting on a token allowance is better refused up front."""
+    from backend.core import chunking, tokens
+
+    from backend import governance
+
+    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 8_000)
+    monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
+    monkeypatch.setattr(chunking, "MAX_PLAN_SECONDS", 5)
+    # The suite runs with an effectively unlimited allowance so pacing never
+    # interferes; this test is specifically about pacing, so it needs a real
+    # one. Without it the projected wait is zero and there is nothing to refuse.
+    monkeypatch.setattr(governance.token_limiter, "per_minute", 8_000)
+    for_tool("unit-tests")
+
+    # Many distinct functions: no pattern to collapse, no per-line score, so
+    # this genuinely needs chunking.
+    code = "\n\n".join(
+        f"def function_{i}(x, y):\n"
+        f"    if x > {i}:\n"
+        f"        raise ValueError('over {i}')\n"
+        f"    return x * y + {i}"
+        for i in range(400)
+    )
+    res = client.post("/api/unit-tests", json={"input": code})
     assert res.status_code == 413, res.text
     body = res.json()
-    assert "context window" in body["error"] or "chunks" in body["error"]
+    assert "model calls" in body["error"]
+    assert "tokens/minute" in body["error"]
     assert body["hint"]
 
 
@@ -329,12 +363,14 @@ def test_the_token_budget_sheds_before_spending_upstream_quota(client, for_tool,
     """Groq's free tier binds on tokens per minute, not requests per minute."""
     from backend import governance
 
-    monkeypatch.setattr(governance.token_limiter, "per_minute", 5_000)
     stub = for_tool("log-rca")
 
     first = client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     assert first.status_code == 200
     calls_after_first = stub.call_count
+
+    # Spend the rest of the minute's allowance, as a second large request would.
+    governance.token_limiter.record("testclient", governance.token_limiter.per_minute)
 
     second = client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     assert second.status_code == 429
@@ -350,13 +386,30 @@ def test_repair_attempts_respect_the_token_budget(client, for_tool, monkeypatch)
     """A repair costs as much as the original call and must not blow the budget."""
     from backend import governance
 
-    # Enough for one call, not two.
-    monkeypatch.setattr(governance.token_limiter, "per_minute", 4_500)
     stub = for_tool("log-rca")
+
+    # Measure what one call actually costs instead of assuming a figure. Each
+    # tool reserves a different amount of output, so a hardcoded headroom here
+    # stops testing anything the day a reserve changes -- which is exactly how
+    # this test came to pass while shedding no longer happened.
+    warmup = client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
+    assert warmup.status_code == 200, warmup.text
+    one_call = warmup.json()["usage"]["total_tokens"]
+    assert one_call > 0
+
+    # Both windows: the warmup's usage sits in the day window too, and leaving
+    # it there sheds the first attempt rather than the repair.
+    governance.token_limiter._minute.clear()
+    governance.token_limiter._day.clear()
+    stub.calls.clear()
     stub.script("not json at all")
 
+    # Room for the first call and not the repair that follows it.
+    limit = governance.token_limiter.per_minute
+    governance.token_limiter.record("testclient", limit - int(one_call * 1.4))
+
     res = client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
-    assert res.status_code == 429
+    assert res.status_code == 429, res.text
     # One attempt made, the repair shed locally rather than 429'd upstream.
     assert stub.call_count == 1
 
@@ -494,3 +547,62 @@ def test_concurrent_requests_each_get_a_distinct_request_id(client, for_tool):
         for _ in range(5)
     }
     assert len(ids) == 5
+
+
+def test_the_token_limiter_accumulates_when_pacing_is_disabled():
+    """A limiter that silently stops limiting is worse than none at all.
+
+    WAIT_FOR_TOKEN_BUDGET=false is a supported configuration: refuse
+    immediately rather than pace. In that mode the pacer used to check the
+    window and return without charging anything, while the caller recorded only
+    the difference against a reservation nobody had made. The arithmetic came
+    out at zero every time, so usage never accumulated and the refusal the
+    limiter existed to produce came from the provider instead.
+    """
+    import asyncio
+
+    from backend import governance
+    from backend.governance import GovernanceError, TokenBudgetLimiter
+
+    limiter = TokenBudgetLimiter(per_minute=10_000, per_day=1_000_000)
+
+    async def spend(tokens: int):
+        return await governance.await_token_budget("c", tokens, stage="test")
+
+    original, governance.WAIT_FOR_TOKEN_BUDGET = governance.WAIT_FOR_TOKEN_BUDGET, False
+    original_limiter, governance.token_limiter = governance.token_limiter, limiter
+    try:
+        assert limiter.remaining("c")[0] == 10_000
+        asyncio.run(spend(4_000))
+        assert limiter.remaining("c")[0] == 6_000, "the reservation was never charged"
+        asyncio.run(spend(4_000))
+        assert limiter.remaining("c")[0] == 2_000
+        with pytest.raises(GovernanceError):
+            asyncio.run(spend(4_000))
+    finally:
+        governance.WAIT_FOR_TOKEN_BUDGET = original
+        governance.token_limiter = original_limiter
+
+
+def test_an_over_reservation_is_refunded_not_leaked():
+    """The output allowance is reserved in full and usually not spent.
+
+    Keeping the difference would burn allowance nobody used: on an 8,000-token
+    minute, a 2,600-token reserve against a 1,200-token answer silently costs
+    the next call its place in the queue, and a seven-part analysis loses most
+    of a whole call to arithmetic that was never true.
+    """
+    from backend.governance import TokenBudgetLimiter
+
+    limiter = TokenBudgetLimiter(per_minute=8_000, per_day=200_000)
+
+    handle = limiter.reserve("c", 5_000)
+    assert limiter.remaining("c")[0] == 3_000
+
+    limiter.settle(handle, 3_200)
+    assert limiter.remaining("c")[0] == 4_800, "the unspent reservation was not released"
+
+    # Settling upward works too: an under-estimate must still be charged.
+    second = limiter.reserve("c", 1_000)
+    limiter.settle(second, 2_500)
+    assert limiter.remaining("c")[0] == 2_300

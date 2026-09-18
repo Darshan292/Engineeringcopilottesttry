@@ -231,6 +231,22 @@ def patch_settings(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_network_metadata_refresh(monkeypatch):
+    """Keep the model-metadata refresh off the network.
+
+    The pipeline opportunistically fetches /models when its cache is stale, and
+    the state reset below makes it stale for every test. With a real key in the
+    environment that meant every single test attempted a live request and waited
+    for it to fail -- which is what turned a 50-second suite into three minutes.
+    """
+    async def _no_refresh() -> bool:
+        return False
+
+    monkeypatch.setattr("backend.pipeline.tools.refresh_model_registry_if_stale", _no_refresh, raising=False)
+    monkeypatch.setattr("backend.groq_client.refresh_model_registry_if_stale", _no_refresh)
+
+
+@pytest.fixture(autouse=True)
 def reset_process_state():
     """Reset every piece of process-global state between tests.
 
@@ -249,6 +265,14 @@ def reset_process_state():
     # budget; `test_api.py` exercises the real ceiling explicitly.
     token_limiter.per_minute = 10_000_000
     token_limiter.per_day = 10_000_000
+
+    # Pacing is on by default in production: a request waits for allowance
+    # rather than failing. In tests that turns an over-budget case into a
+    # 60-second sleep, so the default here is to fail fast; the tests that
+    # exercise waiting enable it explicitly and use a tiny window.
+    import backend.governance as _gov
+
+    _gov.WAIT_FOR_TOKEN_BUDGET = False
 
     def clear():
         limiter._minute.clear()

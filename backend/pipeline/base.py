@@ -56,6 +56,9 @@ class Trace:
     stages: list[Stage] = field(default_factory=list)
     upstream_calls: int = 0
     total_tokens: int = 0
+    # Time spent waiting for token allowance rather than working. Reported so
+    # a slow request is explicable rather than mysterious.
+    waited_seconds: float = 0.0
 
     def record(self, name: str, started: float, summary: dict | None = None, error: str | None = None) -> None:
         self.stages.append(
@@ -72,6 +75,7 @@ class Trace:
             "request_id": self.request_id,
             "upstream_calls": self.upstream_calls,
             "total_tokens": self.total_tokens,
+            "waited_seconds": round(self.waited_seconds, 1),
             "stages": [
                 {"name": s.name, "duration_ms": s.duration_ms, **({"error": s.error} if s.error else {}), **s.summary}
                 for s in self.stages
@@ -222,7 +226,7 @@ async def call_structured(
     last_raw = ""
     used_model = model or ""
 
-    from ..governance import enforce_token_budget, token_limiter
+    from ..governance import await_token_budget, token_limiter
 
     for attempt in range(1, MAX_REPAIR_ATTEMPTS + 2):
         # Check the token budget before each attempt, including repairs. A
@@ -232,11 +236,22 @@ async def call_structured(
         projected = estimate_messages_tokens(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": messages_user}]
         ) + (max_tokens or 0)
-        enforce_token_budget(
+        # Wait for budget rather than failing. On a rate-limited account a
+        # multi-part analysis genuinely takes minutes, and a complete answer
+        # that arrives slowly is worth more than a fast refusal.
+        waited, reservation = await await_token_budget(
             client_key,
             projected,
             stage=f"{stage_name} attempt {attempt}" if attempt > 1 else stage_name,
+            waited_so_far=trace.waited_seconds,
         )
+        trace.waited_seconds += waited
+        if waited:
+            trace.record(
+                f"{stage_name}.wait{attempt}",
+                time.perf_counter() - waited,
+                {"waited_seconds": round(waited, 1), "reason": "token allowance"},
+            )
 
         with timed(trace, f"{stage_name}.attempt{attempt}") as stage:
             result = await complete(
@@ -248,11 +263,13 @@ async def call_structured(
                 json_mode=True,
             )
             trace.upstream_calls += 1
-            # Record what the provider actually charged, not the estimate.
-            token_limiter.record(
-                client_key,
-                int(result["usage"].get("total_tokens") or projected),
-            )
+            # The pacer reserved `projected`; replace it with what the call
+            # actually cost. Settling both ways matters: charging the excess
+            # when the estimate was low keeps the limiter honest, and releasing
+            # the surplus when it was high stops a conservative output reserve
+            # from permanently eating a slice of every minute.
+            actual = int(result["usage"].get("total_tokens") or projected)
+            token_limiter.settle(reservation, actual)
             last_raw = result["text"]
             used_model = result["model"]
             elapsed += result["elapsed_ms"]

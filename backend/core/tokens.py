@@ -186,6 +186,11 @@ DEFAULT_CONTEXT_WINDOW = 8_192
 # input, and a useful reply needs room too.
 MIN_USABLE_CONTEXT = 6_000
 
+# Share of the working window reserved for the model's reply. Structured output
+# for these tools runs a few hundred to ~2,000 tokens; reserving more just
+# starves the input side of the same budget.
+OUTPUT_RESERVE_SHARE = 0.35
+
 # Model families a provider lists that cannot serve chat completions. The
 # /models endpoint returns everything an account can call -- classifiers,
 # speech-to-text, text-to-speech, moderation -- and selecting one produces a
@@ -325,7 +330,15 @@ def context_window_for(model: str) -> tuple[int, str]:
 
 @dataclass
 class TokenBudget:
-    """How much input a request can carry, after everything else is paid for."""
+    """How much input a request can carry, after everything else is paid for.
+
+    `context_window` is the model's limit. `effective_window` is the smaller of
+    that and what the account's tokens-per-minute allowance permits in a single
+    call, and it is the number that matters. A 131,072-token context window on
+    an 8,000 TPM account cannot be used: planning a 100,000-token call against
+    the context window produces a plan that can never execute, which is how a
+    perfectly reasonable input ends up refused.
+    """
 
     model: str
     context_window: int
@@ -333,6 +346,8 @@ class TokenBudget:
     reserved_for_system: int
     safety_margin: int
     available_for_input: int
+    effective_window: int = 0
+    token_allowance_per_minute: int = 0
     calibration: dict = field(default_factory=dict)
     # Where the context window came from. A conservative default means the
     # budget is a guess, and callers surface that.
@@ -345,6 +360,13 @@ class TokenBudget:
         return {
             "model": self.model,
             "context_window": self.context_window,
+            "effective_window": self.effective_window,
+            "token_allowance_per_minute": self.token_allowance_per_minute,
+            "binding_constraint": (
+                "tokens-per-minute allowance"
+                if self.effective_window < self.context_window
+                else "model context window"
+            ),
             "reserved_for_output": self.reserved_for_output,
             "reserved_for_system": self.reserved_for_system,
             "safety_margin": self.safety_margin,
@@ -360,26 +382,49 @@ def build_budget(
     max_output_tokens: int,
     *,
     context_window: int | None = None,
+    token_allowance_per_minute: int | None = None,
 ) -> TokenBudget:
-    """Compute the usable input budget for one request."""
+    """Compute the usable input budget for one request.
+
+    `token_allowance_per_minute` is the account's TPM ceiling. A single call can
+    never exceed it, so it caps the usable window regardless of how large the
+    model's context is. Passing it is what stops the planner from producing
+    plans the token budget will refuse.
+    """
     if context_window:
         window, source = context_window, "explicit"
     else:
         window, source = context_window_for(model)
-    cal = calibrator.for_model(model)
 
+    # One call can never spend more than a minute's whole allowance.
+    effective = window
+    if token_allowance_per_minute and token_allowance_per_minute > 0:
+        effective = min(window, token_allowance_per_minute)
+
+    # The output reserve is subtracted from the same budget as the input, so a
+    # fixed 4,096 on an 8,000-token working window spends half the allowance
+    # before a single line of input is considered. Cap it at a share of what is
+    # actually available; a structured response rarely needs more, and the
+    # caller passes this back as `max_tokens` so the reservation is real.
+    effective_output = min(max_output_tokens, max(512, int(effective * OUTPUT_RESERVE_SHARE)))
+
+    cal = calibrator.for_model(model)
     system_tokens = cal.apply(estimate_tokens(system_prompt)) + 16
 
     # The margin covers estimator error. It starts wide and narrows once the
-    # calibrator has seen enough real completions to be trusted.
+    # calibrator has seen enough real completions to be trusted. It scales with
+    # the effective window, not the nominal one -- an 8k working budget does not
+    # need a 23k margin.
     margin_pct = 0.08 if cal.confident else 0.18
-    margin = max(256, int(window * margin_pct))
+    margin = max(256, int(effective * margin_pct))
 
-    available = window - max_output_tokens - system_tokens - margin
+    available = effective - effective_output - system_tokens - margin
     return TokenBudget(
         model=model,
         context_window=window,
-        reserved_for_output=max_output_tokens,
+        effective_window=effective,
+        token_allowance_per_minute=token_allowance_per_minute or 0,
+        reserved_for_output=effective_output,
         reserved_for_system=system_tokens,
         safety_margin=margin,
         available_for_input=max(0, available),

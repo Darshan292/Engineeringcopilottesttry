@@ -42,7 +42,10 @@ def tiny_window(monkeypatch):
     """
     from backend.core import tokens
 
-    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 16_000)
+    # 16,000 used to force chunking; right-sizing the per-tool output reserve
+    # freed enough budget that a compressed single call now fits, which is the
+    # better outcome but a different code path. 10,000 still forces the split.
+    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 10_000)
     monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
     return None
 
@@ -76,8 +79,11 @@ def test_every_chunk_is_actually_sent(client, for_tool, tiny_window):
     assert len(map_stages) > 1, f"only {len(map_stages)} map stage(s) ran: {stages}"
     assert any(s.startswith("reduce") for s in stages), "no combine step ran"
 
-    # One call per chunk, plus the combine.
-    assert stub.call_count == len(map_stages) + 1
+    # One call per part, plus the combine. The combine is a tree, so with many
+    # parts there is more than one combine call.
+    reduce_calls = len([s for s in stages if s.startswith("reduce.") and "level" not in s])
+    assert stub.call_count == len(map_stages) + reduce_calls
+    assert reduce_calls >= 1
 
 
 def test_no_input_is_silently_discarded(client, for_tool, tiny_window):

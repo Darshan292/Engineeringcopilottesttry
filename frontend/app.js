@@ -24,6 +24,12 @@ const els = {
   sampleNote: $("sample-note"),
   output: $("output"),
   warnings: $("warnings"),
+  planBtn: $("plan-btn"),
+  planPanel: $("plan-panel"),
+  planTitle: $("plan-title"),
+  planCost: $("plan-cost"),
+  planToggle: $("plan-toggle"),
+  planBody: $("plan-body"),
   stats: $("stats"),
   diagBtn: $("diag-btn"),
   diagPanel: $("diag-panel"),
@@ -53,6 +59,9 @@ const state = {
   /** Per-tool draft + result, so switching tabs never loses work. */
   drafts: new Map(),
   results: new Map(),
+  /** The plan shown for the current run, kept so the trace can annotate it. */
+  plan: null,
+  planCollapsed: false,
 };
 
 // --- theme ----------------------------------------------------------------
@@ -213,6 +222,10 @@ function selectTool(toolId) {
     : "";
   els.sampleBtn.disabled = !sample.content;
 
+  // The plan describes one input under one tool; carrying it across a switch
+  // would show a split that has nothing to do with what is now in the box.
+  hidePlan();
+
   const prior = state.results.get(toolId);
   if (prior) {
     paintResult(prior);
@@ -254,6 +267,7 @@ els.emptySample.addEventListener("click", loadSample);
 
 els.clearBtn.addEventListener("click", () => {
   els.input.value = "";
+  hidePlan();
   updateCharCount();
   els.input.focus();
 });
@@ -289,6 +303,24 @@ function showThinking() {
   renderWarnings([]);
   els.copyBtn.disabled = true;
   els.downloadBtn.disabled = true;
+}
+
+/**
+ * Replace the optimistic timing line when the plan says this will be slow.
+ *
+ * "Typically 3-15 seconds" next to a seven-call paced analysis reads as a hang.
+ * The number here comes from the plan's own arithmetic, so it is the same
+ * figure the backend refused or accepted the plan on.
+ */
+function showThinkingLong(plan) {
+  const calls = plan.steps.filter((s) => s.kind === "model").length;
+  els.output.innerHTML =
+    '<div class="thinking"><span class="spinner"></span>' +
+    `<span>Analysing in ${calls} parts…</span></div>` +
+    `<p class="thinking-hint">This input was split because it does not fit one call. ` +
+    `Expect roughly ${escapeHtml(formatDuration(plan.context.estimated_seconds))}, most of it ` +
+    `spent waiting for the per-minute token allowance rather than on the model. ` +
+    `Nothing is dropped to make it faster.</p>`;
 }
 
 function showError(message, hint) {
@@ -602,6 +634,193 @@ async function renderMermaidBlocks() {
   }
 }
 
+// --- execution plan -------------------------------------------------------
+//
+// The plan is fetched from the backend before the run, from an endpoint that
+// makes no model call. It is the same planner the run uses, so what is shown
+// here is what will happen -- not an estimate that can drift from it.
+//
+// Nothing is faked while the run is in flight. There is no per-step progress,
+// because the browser cannot observe a step finishing; what the panel shows
+// during a run is the elapsed clock and the plan, and what it shows afterwards
+// is the real per-stage timing from the response's trace. A progress bar that
+// invents its own position is worse than no progress bar.
+
+const PLAN_KIND_LABEL = {
+  deterministic: "local",
+  model: "model",
+  blocked: "refused",
+};
+
+async function fetchPlan(toolId, text) {
+  const res = await fetch(`/api/plan/${toolId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input: text }),
+  });
+  const payload = await res.json();
+  if (!res.ok) throw new Error(payload.error || `Planning failed (${res.status}).`);
+  return payload;
+}
+
+function planCostLine(plan) {
+  const calls = plan.steps.filter((s) => s.kind === "model").length;
+  const ctx = plan.context || {};
+  const bits = [
+    `${calls} model call${calls === 1 ? "" : "s"}`,
+    `${plan.steps.filter((s) => s.kind === "deterministic").length} local stages`,
+    `~${Number(ctx.estimated_input_tokens || 0).toLocaleString()} input tokens`,
+  ];
+  if (ctx.estimated_seconds) bits.push(`~${formatDuration(ctx.estimated_seconds)} of pacing`);
+  return bits.join(" · ");
+}
+
+function formatDuration(seconds) {
+  const s = Math.round(seconds);
+  if (s < 60) return `${s}s`;
+  return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+}
+
+/**
+ * Render the plan. `phase` is "preview" (nothing running), "running", or
+ * "done" (a trace is available to annotate with).
+ */
+function renderPlan(plan, phase, trace) {
+  state.plan = plan;
+  els.planPanel.hidden = false;
+  els.planTitle.textContent = plan.feasible
+    ? `Execution plan — ${plan.context.strategy.replace("_", "-")}`
+    : "Execution plan — would be refused";
+  els.planCost.textContent = planCostLine(plan);
+
+  const timings = stageTimings(trace);
+
+  const extracted = (plan.extracted || [])
+    .map((line) => `<li>${escapeHtml(line)}</li>`)
+    .join("");
+
+  const steps = (plan.steps || [])
+    .map((step, index) => {
+      const timing = timings[index];
+      const cls = `plan-step plan-${step.kind}` + (timing ? " plan-done" : "");
+      const badge = PLAN_KIND_LABEL[step.kind] || step.kind;
+      const ms = timing ? `<span class="plan-ms">${timing}</span>` : "";
+      return (
+        `<li class="${cls}">` +
+        `<span class="plan-badge">${escapeHtml(badge)}</span>` +
+        `<span class="plan-name">${escapeHtml(step.name)}</span>` +
+        ms +
+        `<span class="plan-detail">${escapeHtml(step.detail)}</span>` +
+        "</li>"
+      );
+    })
+    .join("");
+
+  const running =
+    phase === "running"
+      ? '<p class="plan-running"><span class="spinner"></span>' +
+        `<span id="plan-clock">Running… 0s elapsed</span></p>`
+      : "";
+
+  els.planBody.innerHTML =
+    `<p class="plan-why">${escapeHtml(plan.narrative || "")}</p>` +
+    (extracted
+      ? `<div class="plan-extracted"><h4>Extracted before any model call</h4><ul>${extracted}</ul></div>`
+      : "") +
+    `<ol class="plan-steps">${steps}</ol>` +
+    running;
+
+  els.planBody.hidden = state.planCollapsed;
+}
+
+/**
+ * Map plan steps onto the trace's real stage timings.
+ *
+ * Only the model steps are matched, positionally, against the upstream call
+ * stages the run actually recorded. Local stages are not matched: several plan
+ * steps describe work the trace records under one name, and guessing a
+ * correspondence would put a number next to a step that did not produce it.
+ *
+ * One logical call can appear as several attempts (`llm_structured.attempt1`,
+ * `.attempt2`) when the first response failed validation and was repaired.
+ * Those are summed into the call they belong to and the repair count is shown,
+ * because "820 ms" next to a step that actually took three round trips is the
+ * kind of true-looking number that stops people asking the right question.
+ *
+ * Waiting stages are excluded from the call time and surfaced separately: time
+ * spent held back by the token allowance is not time the model spent thinking.
+ */
+function stageTimings(trace) {
+  if (!trace || !Array.isArray(trace.stages)) return {};
+
+  /** base call name -> {ms, attempts, waited} */
+  const calls = new Map();
+  const order = [];
+
+  for (const stage of trace.stages) {
+    const name = String(stage.name || "");
+    const match = name.match(/^(llm_structured|map\.part\d+|reduce\.[\w.]+?)\.(attempt|wait)(\d+)$/);
+    if (!match) continue;
+    const base = match[1];
+    if (!calls.has(base)) {
+      calls.set(base, { ms: 0, attempts: 0, waited: 0 });
+      order.push(base);
+    }
+    const entry = calls.get(base);
+    const ms = Number(stage.duration_ms) || 0;
+    if (match[2] === "attempt") {
+      entry.ms += ms;
+      entry.attempts += 1;
+    } else {
+      entry.waited += Number(stage.waited_seconds) || ms / 1000;
+    }
+  }
+
+  const out = {};
+  let cursor = 0;
+  (state.plan && state.plan.steps ? state.plan.steps : []).forEach((step, index) => {
+    if (step.kind !== "model") return;
+    const entry = calls.get(order[cursor++]);
+    if (!entry) return;
+    const bits = [`${entry.ms.toLocaleString()} ms`];
+    if (entry.attempts > 1) bits.push(`${entry.attempts} attempts`);
+    if (entry.waited >= 1) bits.push(`+${formatDuration(entry.waited)} waiting`);
+    out[index] = bits.join(" · ");
+  });
+  return out;
+}
+
+function startPlanClock() {
+  const started = Date.now();
+  return window.setInterval(() => {
+    const el = document.getElementById("plan-clock");
+    if (!el) return;
+    el.textContent = `Running… ${formatDuration((Date.now() - started) / 1000)} elapsed`;
+  }, 1000);
+}
+
+function hidePlan() {
+  els.planPanel.hidden = true;
+  els.planBody.innerHTML = "";
+  state.plan = null;
+}
+
+async function showPlanOnly() {
+  const tool = currentTool();
+  const text = els.input.value.trim();
+  if (!tool || !text || state.running) return;
+  els.planBtn.disabled = true;
+  try {
+    const plan = await fetchPlan(tool.id, text);
+    renderPlan(plan, "preview", null);
+    els.planPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } catch (err) {
+    showError(String(err && err.message ? err.message : err), "Planning happens locally; this is a bug if the backend is up.");
+  } finally {
+    els.planBtn.disabled = false;
+  }
+}
+
 // --- run ------------------------------------------------------------------
 
 async function run() {
@@ -612,10 +831,27 @@ async function run() {
 
   state.running = true;
   els.runBtn.disabled = true;
+  els.planBtn.disabled = true;
   els.runLabel.textContent = "Running";
   showThinking();
 
+  let clock = null;
   try {
+    // Plan first, and show it. It costs nothing, and it answers "what is this
+    // about to do to my input" before the model is involved rather than after.
+    // A failure here is not fatal: the run is what the user asked for, and
+    // losing the panel is better than losing the answer.
+    try {
+      const plan = await fetchPlan(tool.id, text);
+      renderPlan(plan, "running", null);
+      clock = startPlanClock();
+      if (plan.context && plan.context.estimated_seconds > 20) {
+        showThinkingLong(plan);
+      }
+    } catch {
+      hidePlan();
+    }
+
     const res = await fetch(`/api/${tool.id}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -631,18 +867,24 @@ async function run() {
 
     if (!res.ok) {
       showError(payload.error || payload.detail || `Request failed (${res.status}).`, payload.hint);
+      // Keep the plan visible but stop presenting it as in flight -- on a
+      // refusal it holds the arithmetic that explains the refusal.
+      if (state.plan) renderPlan(state.plan, "preview", null);
       return;
     }
 
     state.results.set(tool.id, payload);
     paintResult(payload);
+    if (state.plan) renderPlan(state.plan, "done", payload.trace);
   } catch (err) {
     showError(
       String(err && err.message ? err.message : err),
       "If this says 'Failed to fetch', the backend is not running or the page was opened as a file:// URL."
     );
   } finally {
+    if (clock) window.clearInterval(clock);
     state.running = false;
+    els.planBtn.disabled = false;
     els.runLabel.textContent = "Run";
     updateCharCount();
     refreshTokenBudget();
@@ -650,6 +892,13 @@ async function run() {
 }
 
 els.runBtn.addEventListener("click", run);
+els.planBtn.addEventListener("click", showPlanOnly);
+els.planToggle.addEventListener("click", () => {
+  state.planCollapsed = !state.planCollapsed;
+  els.planBody.hidden = state.planCollapsed;
+  els.planToggle.setAttribute("aria-expanded", String(!state.planCollapsed));
+  els.planToggle.innerHTML = state.planCollapsed ? "&plus;" : "&minus;";
+});
 els.diagBtn.addEventListener("click", () => {
   els.diagPanel.hidden = !els.diagPanel.hidden;
 });

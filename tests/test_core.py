@@ -360,12 +360,140 @@ def test_every_chunk_carries_global_context():
 
 
 def test_chunk_explosion_is_refused_not_silently_executed():
-    """Hundreds of chunks would exhaust a free-tier daily quota in one request."""
-    ir = parse_logs(_big_log(60_000))
-    plan = plan_context(ir, build_budget("tiny-unknown-model", "sys", 1024))
+    """Hundreds of calls would exhaust a free-tier quota in one request.
+
+    The cap is passed in rather than inherited from the module default: the
+    behaviour under test is "a plan over the cap is refused with its arithmetic
+    shown", and tying that to whatever the default happens to be meant the test
+    quietly stopped exercising it when the default was raised.
+
+    Code, not logs, because code has no per-item relevance score and so has no
+    lossy fallback to degrade into -- a refusal is the only correct outcome.
+    """
+    from backend.parsers.code import parse_code
+
+    code = "\n\n".join(
+        f"def function_{i}(x):\n    if x > {i}:\n        raise ValueError('over')\n    return x"
+        for i in range(400)
+    )
+    ir = parse_code(code)
+    budget = build_budget("tiny-unknown-model", "sys", 1024)
+
+    # Confirm the premise: this input genuinely needs splitting.
+    unrestricted = plan_context(ir, budget)
+    assert unrestricted.strategy == "map_reduce"
+    assert len(unrestricted.chunks) > 3
+
+    plan = plan_context(ir, budget, max_chunks=3)
     assert plan.strategy == "reject"
-    assert "upstream calls" in plan.reason
+    assert "model calls" in plan.reason
+    assert "exceeds the limit of 3" in plan.reason
+    assert plan.estimated_calls > 1
     assert plan.chunks == []
+
+
+def _varied_log(lines: int) -> str:
+    """A log with no single dominant pattern, so grouping cannot collapse it.
+
+    `_big_log` repeats one message shape, which the summary strategy compresses
+    almost perfectly -- useful for testing compression, useless for testing what
+    happens when compression is not enough.
+    """
+    shapes = [
+        "ERROR svc-a [db] timeout after {i}ms id={i}",
+        "WARN svc-b [cache] miss key=user:{i} region=eu-{i}",
+        "INFO svc-c [api] GET /orders/{i} 200 in {i}ms",
+        "ERROR svc-d [queue] nack job={i} reason=deadline-{i}",
+    ]
+    return "\n".join(
+        f"2026-09-14T02:{i // 60 % 60:02d}:{i % 60:02d}Z " + shapes[i % 4].format(i=i)
+        for i in range(lines)
+    )
+
+
+def test_full_coverage_is_preferred_over_a_cheaper_lossy_plan():
+    """Reading every line beats reading the loudest ones, and costs more.
+
+    Selection is one call and chunking is N+1, so the cheap strategy is the
+    tempting one. It is also the only lossy one: it keeps the highest-scoring
+    lines and drops the text of the rest. When both are affordable the input
+    must be read in full, however many calls that takes.
+    """
+    ir = parse_logs(_varied_log(600))
+    plan = plan_context(
+        ir, build_budget("qwen/qwen3.6-27b", "sys", 2_200, token_allowance_per_minute=8_000)
+    )
+    assert plan.strategy == "map_reduce", (
+        f"a 600-line log that fits in {len(plan.chunks)} parts was reduced instead of read"
+    )
+    assert plan.estimated_calls > 1
+    # Every line lands in exactly one part: nothing is dropped to make it fit.
+    covered = sum(len(c.item_ids) for c in plan.chunks)
+    assert covered == 600, f"{600 - covered} lines were not assigned to any part"
+    assert len({i for c in plan.chunks for i in c.item_ids}) == 600
+
+
+def test_selection_is_the_fallback_when_full_coverage_is_unaffordable():
+    """Degrade with the arithmetic shown, rather than refuse outright."""
+    ir = parse_logs(_varied_log(20_000))
+    plan = plan_context(
+        ir, build_budget("qwen/qwen3.6-27b", "sys", 2_200, token_allowance_per_minute=8_000)
+    )
+    assert plan.strategy == "selected"
+    assert plan.estimated_calls == 1
+    assert plan.estimated_input_tokens <= plan.budget.available_for_input
+    # It must say what it gave up and what it would take to get it back.
+    assert "full coverage was not attempted" in plan.reason
+    assert "model calls" in plan.reason
+    assert "TOKEN_LIMIT_PER_MINUTE" in plan.reason
+    # And the model is told, in the plan it receives, that this is partial.
+    assert "DEGRADED" in plan.describe()
+
+
+def test_a_uniform_huge_log_resolves_to_one_call_inside_the_budget():
+    """60,000 lines of one message shape collapse to a single call.
+
+    Whether that lands on grouping or on selection depends on how much of the
+    allowance the summary itself consumes -- on a small allowance even one
+    template's summary overflows. Either way it is one call, it fits, and if it
+    gave anything up it says so.
+    """
+    ir = parse_logs(_big_log(60_000))
+    plan = plan_context(
+        ir, build_budget("qwen/qwen3.6-27b", "sys", 1024, token_allowance_per_minute=8000)
+    )
+    assert plan.strategy in {"summary", "selected"}
+    assert plan.estimated_calls == 1
+    assert plan.estimated_input_tokens <= plan.budget.available_for_input
+    if plan.strategy == "selected":
+        assert "DEGRADED" in plan.describe()
+
+
+def test_the_plan_is_explained_in_plain_language():
+    """The caller is entitled to know their input was reduced and by what rule."""
+    ir = parse_logs(_big_log(40_000))
+    plan = plan_context(ir, build_budget("qwen/qwen3.6-27b", "sys", 1024, token_allowance_per_minute=8000))
+    description = plan.describe()
+    assert "PROCESSING PLAN" in description
+    assert "Budget:" in description
+    assert str(plan.budget.available_for_input) in description.replace(",", "")
+
+
+def test_the_budget_is_capped_by_the_token_allowance():
+    """A 131k context window on an 8k/min account is not a 131k budget."""
+    from backend.prompts import TOOL_PROMPTS
+
+    generous = build_budget("qwen/qwen3.6-27b", TOOL_PROMPTS["log-rca"], 4096)
+    limited = build_budget(
+        "qwen/qwen3.6-27b", TOOL_PROMPTS["log-rca"], 4096, token_allowance_per_minute=8000
+    )
+    assert generous.effective_window == generous.context_window
+    assert limited.effective_window == 8000
+    assert limited.available_for_input < generous.available_for_input
+    assert limited.public()["binding_constraint"] == "tokens-per-minute allowance"
+    # The output reserve must not eat the whole small window.
+    assert limited.reserved_for_output < limited.effective_window * 0.4
+    assert limited.available_for_input > 0
 
 
 def test_full_render_includes_the_skeleton():

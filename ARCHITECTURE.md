@@ -47,12 +47,56 @@ that can be checked.
 | Injection scan | `core/injection.py` | Injection attempts are detected, reported, and defanged in place before the call. |
 | Parse | `parsers/*` | Real extraction: Python AST, route decorators and `raise` bodies, log field splitting and template mining, transcript speaker anonymization. |
 | Budget | `core/tokens.py` | Context limits are computed, not guessed. The estimator self-calibrates against `usage.prompt_tokens` from real responses. |
-| Plan context | `core/chunking.py` | Oversize input is compressed or chunked with global context attached, or refused with a reason. Never silently truncated. |
-| **Model call** | `pipeline/base.py` | Judgement only. Output must satisfy a JSON schema; failures feed a bounded repair loop. Chunked input runs one call per part plus a combine. |
+| Plan context | `core/chunking.py` | Oversize input is compressed or chunked with global context attached, degraded to a scored subset only when full coverage is unreachable, or refused with the arithmetic. Never silently truncated. |
+| **Model call** | `pipeline/base.py` | Judgement only. Output must satisfy a JSON schema; failures feed a bounded repair loop. Chunked input runs one call per part plus a combine tree. |
 | Verify evidence | `validation/grounding.py` | Every cited ID is checked against the parser's output. Fabrications are named and their rows removed. |
 | Domain validation | `validation/{python_exec,openapi}.py` | Generated tests are executed. Generated OpenAPI is schema-validated and cross-checked against the real routes. |
 | Confidence | `validation/confidence.py` | Computed from measurable signals, not asked for. The model's own rating is shown beside it. |
 | Render | `render/markdown.py` | Section order, tables and caveats are produced by code, identical every run. |
+
+## The strategy ladder
+
+Ordered by how much of the input survives, not by what is cheapest:
+
+| Strategy | Calls | What is lost |
+|---|---|---|
+| `full` | 1 | nothing |
+| `summary` | 1 | repeated lines become a pattern with counts; no line is unaccounted for |
+| `map_reduce` | N + combine tree | nothing — every line is read by exactly one part |
+| `selected` | 1 | the text of low-scoring lines; they stay counted in the pattern table |
+| `reject` | 0 | — |
+
+`selected` is the only lossy strategy and it sits *below* map-reduce
+deliberately. It was above it once, on the reasoning that one call beats N+1 —
+which is true about cost and wrong about the product. A 600-line log that could
+have been read in full across thirteen paced calls was instead thinned to forty
+lines and answered in one: faster, cheaper, and a worse answer to the question
+the user asked. Selection is now the fallback, reached only when reading
+everything is out of budget, and when it is reached the plan says so, shows the
+arithmetic that ruled full coverage out, and names what would buy it back. The
+model is told in its own prompt that it is looking at a subset — a model that
+believes it read everything states its conclusions flatly and is wrong.
+
+## Showing the plan before executing it
+
+`POST /api/plan/{tool}` runs the deterministic front half — redact, classify,
+scan, parse, budget, plan — and returns what would happen, with no model call
+and no token spend. The UI's **Plan** button uses it, and a run fetches it first
+so the panel is populated before the first call goes out.
+
+It calls the same parsers and the same planner as the run. That is the whole
+design constraint: a preview produced by a separate estimator can disagree with
+the run, and a preview that can be wrong about the thing it exists to report is
+worse than no preview. The test
+`test_the_promised_call_count_holds_for_a_split_input` exists because that
+happened — the planner priced the combine as one call, the runtime built a tree,
+and the panel advertised 14 calls for a run that made 27.
+
+Nothing about progress is invented. The browser cannot observe a stage
+finishing, so during a run the panel shows the plan and an elapsed clock;
+per-call timings appear afterwards, taken from the response's own trace, with
+repair attempts summed into the call they belong to and waiting time reported
+separately from model time.
 
 ## Why each choice
 
@@ -188,9 +232,29 @@ These are real and not papered over:
 - **Confidence measures evidence quality, not correctness.** A well-evidenced
   wrong answer can still score high. The weights are a defensible starting
   point, not a calibrated model.
-- **Map-reduce is capped at 12 chunks.** Beyond that the input is refused
-  rather than silently spending a day's free-tier quota on one request. A
-  chunked run costs N+1 model calls and the response says so.
+- **Map-reduce is capped, and the cap is arithmetic rather than a constant.**
+  Three separate limits refuse a plan *before* any call is paid for: more than
+  `DEFAULT_MAX_CHUNKS` (40) parts; a projected wait over `MAX_PLAN_SECONDS`
+  (600s); or a combine tree that cannot converge. The last one matters most and
+  is the least obvious: a combine call must hold at least two partial answers or
+  the tree never shrinks, and with two per batch only `2**4 = 16` parts fold
+  inside the runtime's four-round limit. Discovering that at the final combine
+  costs every map call that came before it, so the planner computes it up front.
+  Where a relevance score exists, these limits degrade to a scored subset with
+  the arithmetic shown instead of refusing outright.
+- **The promised call count is an upper bound, not a prediction.** How many
+  partial answers fit one combine call depends on how verbose the model is,
+  which is unknowable before the calls happen. The plan assumes every partial
+  uses its full output allowance, so the run can come in under the promise and
+  never over it. Coming in over would mean spending quota nobody agreed to.
+- **A long analysis is a long HTTP request.** Full coverage on a free-tier
+  allowance is genuinely minutes: 600 varied log lines at 8,000 tokens/minute is
+  13 parts and roughly seven minutes, almost all of it spent waiting on the
+  allowance rather than on the model. The request is synchronous, so a reverse
+  proxy or gateway with a shorter read timeout will cut it off. Raise those
+  timeouts alongside `MAX_PLAN_SECONDS`, or leave the default and accept the
+  lossy `selected` fallback for the largest inputs. Streaming or a job queue
+  would fix this properly and neither is built.
 - **Data still leaves the machine.** Redacted and structured, but the extracted
   facts go to Groq. That is a property of the product category. Point
   `GROQ_BASE_URL` at a local model if it matters.

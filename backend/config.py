@@ -66,6 +66,35 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# How many output tokens each tool actually needs. A flat reservation is
+# wasteful where it is too big and truncating where it is too small, and on a
+# hard tokens-per-minute ceiling the waste is the difference between a request
+# fitting and being refused: reserving 4,096 for a reply that runs to 1,800
+# spends a quarter of an 8,000-token minute on nothing.
+#
+# Sized from what each schema actually produces. `api-docs` is the outlier
+# because a full OpenAPI document is long.
+TOOL_OUTPUT_TOKENS: dict[str, int] = {
+    "unit-tests": 2_600,
+    "api-docs": 3_600,
+    "log-rca": 2_200,
+    "postmortem": 2_800,
+}
+
+# A map-reduce partial is a narrower answer over a slice of the input, so it
+# needs far less room than the final combined document.
+MAP_OUTPUT_TOKENS = 1_200
+
+
+def output_tokens_for(tool: str, *, is_map_step: bool = False) -> int:
+    if is_map_step:
+        return MAP_OUTPUT_TOKENS
+    configured = os.getenv("GROQ_MAX_TOKENS")
+    if configured and configured.strip().isdigit():
+        return int(configured)
+    return TOOL_OUTPUT_TOKENS.get(tool, 2_600)
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":

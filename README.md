@@ -108,8 +108,35 @@ into templates with counts and first/last occurrence: a 60,000-line log
 compresses about 242x. When it still does not fit, the input is split, **every
 part is analysed in its own call**, and a combine step reasons over the partial
 findings plus the global overview — so a cause in part 2 and its effects in
-part 5 remain connectable. When even that will not work, you get a refusal with
-a reason and options, never a silent analysis of 3% of the log.
+part 5 remain connectable. With many parts the combine itself becomes a tree:
+batches are merged, then the merges are merged, so the final call never
+overflows.
+
+**Reading everything beats reading the loudest parts.** The strategy ladder is
+ordered by how much of your input survives, not by what is cheapest:
+
+| Strategy | Calls | What is lost |
+|---|---|---|
+| `full` | 1 | nothing |
+| `summary` | 1 | repeated lines become a pattern with counts; no line is unaccounted for |
+| `map_reduce` | N+1 | nothing — every line is read by exactly one part |
+| `selected` | 1 | the text of low-scoring lines; they stay counted in the pattern table |
+| `reject` | 0 | — |
+
+`selected` is the only lossy strategy, so it is the **fallback**, not the
+preference. It is reached only when reading everything is genuinely out of
+budget, and when that happens the plan says so, shows the arithmetic that ruled
+full coverage out, and names what would buy it back. The model is told, in the
+plan text it receives, that it is looking at a subset — a model that believes it
+read everything states its conclusions flatly and is wrong.
+
+**You can see the plan before you pay for it.** `POST /api/plan/{tool}` and the
+**Plan** button run the same redaction, parsing, budgeting and planner the real
+run uses, and make no model call at all. You get what was extracted before the
+model is involved, how the input will be split, which parts carry which line
+IDs, how many calls it will take and roughly how long — including a refusal and
+its reason, if that is what would happen. It is the same code path as the run,
+because a preview that can disagree with the run is a lie with a progress bar.
 
 **A call may only cite what that call saw.** Evidence IDs are scoped per call,
 so the model cannot cite a real line it was never shown — which would otherwise
@@ -151,6 +178,9 @@ All optional, all defaulting to sensible local-use values.
 | Request limit | 20/min, 500/day, shed locally | `RATE_LIMIT_PER_MINUTE`, `RATE_LIMIT_PER_DAY` |
 | **Token budget** | 8k/min, 200k/day; adopted from provider headers | `TOKEN_LIMIT_PER_MINUTE`, `TOKEN_LIMIT_PER_DAY` |
 | Concurrency | 4 simultaneous upstream calls | `MAX_CONCURRENT_REQUESTS` |
+| Pacing | wait for token budget rather than refuse | `WAIT_FOR_TOKEN_BUDGET` |
+| Max wait, one request | 600s total spent waiting on the allowance | `MAX_TOTAL_WAIT_SECONDS` |
+| Max planned duration | 600s; past this, full coverage degrades to selection | `MAX_PLAN_SECONDS` |
 | Auth | off (pointless on localhost) | `API_TOKENS` |
 | CORS | loopback origins only | `CORS_ORIGINS` |
 | Model allowlist | any | `ALLOWED_MODELS`, `ALLOW_MODEL_OVERRIDE` |
@@ -171,6 +201,7 @@ body and the `X-Request-ID` header, and a per-stage timing trace.
 | `POST` | `/api/api-docs` | same shape |
 | `POST` | `/api/log-rca` | same shape |
 | `POST` | `/api/postmortem` | same shape |
+| `POST` | `/api/plan/{tool}` | same shape — what the run **would** do. No model call, no tokens. |
 | `GET` | `/api/tools` | tab metadata + samples (the UI builds itself from this) |
 | `GET` | `/api/config` | non-secret config, governance state, your rate-limit usage |
 | `GET` | `/api/models` | live model list from Groq |
@@ -215,7 +246,7 @@ Errors carry a remediation, not just a status code:
 ## Tests
 
 ```bash
-.venv/bin/pytest                        # 217 tests, no network, no key, no cost
+.venv/bin/pytest                        # 256 tests, no network, no key, no cost
 node --test tests/markdown.test.mjs     # 22 renderer tests including XSS
 ```
 
@@ -223,6 +254,16 @@ The suites cover the deterministic layer, every parser, the validation layer
 (including really executing generated tests), the API and governance, and an
 adversarial set: prompt injection, leaked secrets, fabricated citations,
 malformed code, 50k-line logs, contradictory evidence and repair-loop bounds.
+
+Two suites exist because the thing they check was once wrong and the existing
+tests could not see it:
+
+- `test_statelessness.py` proves no content carries between requests, using two
+  vocabulary-disjoint inputs, so leakage would be unmistakable rather than
+  plausible.
+- `test_plan_preview.py` proves the plan shown before a run is the plan the run
+  follows — including that the promised model-call count bounds the real one on
+  a split input, which is where it was previously wrong by 2x.
 
 **These prove the system behaves correctly. They say nothing about whether the
 model's analysis is any good.** That needs a real model:

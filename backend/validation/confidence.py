@@ -139,7 +139,14 @@ def compute_confidence(
     factors.append(Factor("input_parse_rate", parse_rate, 0.15, f"{parse_rate:.0%} of input parsed"))
 
     # 5. Context completeness.
-    completeness = {"full": 1.0, "summary": 0.75, "map_reduce": 0.55}.get(context_strategy, 0.5)
+    completeness = {
+        "full": 1.0,
+        "summary": 0.75,
+        # A relevance-selected view is a deliberate subset: high-value lines are
+        # present, the rest are represented only as pattern counts.
+        "selected": 0.6,
+        "map_reduce": 0.55,
+    }.get(context_strategy, 0.5)
     if context_strategy != "full":
         warnings.append(
             f"The model saw a {context_strategy} view of the input, not the whole thing."

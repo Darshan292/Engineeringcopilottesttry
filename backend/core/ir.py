@@ -140,6 +140,49 @@ class LogIR(IRBase):
                 lines.append(f"    [{tpl.id}] x{tpl.count} {tpl.level or '-'} :: {tpl.template[:110]}")
         return "\n".join(lines)
 
+    def render_selected(self, budget_tokens: int) -> tuple[str, dict]:
+        """Skeleton plus the highest-value lines that fit `budget_tokens`.
+
+        Replaces "keep the first N of each pattern" with an explicit relevance
+        score, so a tight budget spends itself on the lines that carry
+        diagnostic weight rather than on whichever happened to come first.
+        """
+        from .relevance import select_within_budget
+        from .tokens import estimate_tokens
+
+        skeleton = self.skeleton()
+
+        def assemble(kept, note_text):
+            body = "\n".join(_render_entry(e) for e in kept)
+            note = f"\n\n{note_text}" if note_text else ""
+            return f"{skeleton}\n\nSELECTED LINES\n{body}{note}"
+
+        # Budget for the lines themselves, leaving room for the skeleton and
+        # the section framing.
+        overhead = estimate_tokens(skeleton) + 160
+        report = select_within_budget(
+            self, max(0, budget_tokens - overhead), estimate=estimate_tokens, render=_render_entry
+        )
+
+        # Verify the assembled result rather than trusting the headroom
+        # estimate. Guessing the framing cost overshot by 10-130 tokens, which
+        # meant the caller's fit check failed every time and this strategy
+        # never activated -- a large log fell through to chunking and was then
+        # refused for needing too many parts.
+        kept = list(report.kept)
+        rendered = assemble(kept, report.coverage_note)
+        while kept and estimate_tokens(rendered) > budget_tokens:
+            # Drop from the end: entries are ordered by line number, and the
+            # selector already ranked by relevance, so the tail is the least
+            # valuable material that survived scoring.
+            kept.pop()
+            rendered = assemble(kept, report.coverage_note)
+
+        if len(kept) != len(report.kept):
+            report.kept = kept
+
+        return rendered, report.public()
+
     def render(
         self,
         detail: Literal["full", "summary", "skeleton"] = "full",
@@ -314,9 +357,28 @@ class CodeIR(IRBase):
         for func in self.all_functions():
             blocks.append(_render_function(func, detail))
 
+        # The extracted facts already inline each function's source. Appending
+        # the whole file again sent the same code twice in one prompt, which on
+        # a tokens-per-minute budget is a straight waste of a third of it. Only
+        # module-level code the function renders cannot show is added back.
         if detail == "full" and self.source:
-            blocks.append(f"\nFULL SOURCE\n{self.source}")
+            leftover = _module_level_source(self)
+            if leftover.strip():
+                blocks.append(f"\nMODULE-LEVEL CODE (outside any function)\n{leftover}")
         return "\n".join(blocks)
+
+
+def _module_level_source(ir: "CodeIR") -> str:
+    """Source lines not already covered by a rendered function or class."""
+    covered: set[int] = set()
+    for func in ir.all_functions():
+        covered.update(range(func.line_start, func.line_end + 1))
+    for cls in ir.classes:
+        covered.update(range(cls.line_start, cls.line_end + 1))
+    lines = ir.source.split("\n")
+    return "\n".join(
+        line for number, line in enumerate(lines, start=1) if number not in covered
+    )
 
 
 def _render_function(func: FunctionSpec, detail: str) -> str:
