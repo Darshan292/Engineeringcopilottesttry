@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Engineering Copilot</title>
+<meta name="description" content="Four local engineering tools backed by the Groq free tier." />
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">&gt;_</span>
+    <div>
+      <h1>Engineering Copilot</h1>
+      <p class="brand-sub">Local, stateless, free tier. Nothing is stored.</p>
+    </div>
+  </div>
+
+  <div class="topbar-right">
+    <div class="model-chip" id="model-chip" title="Active model (set GROQ_MODEL in .env)">
+      <span class="dot dot-unknown" id="status-dot"></span>
+      <span id="model-name">connecting…</span>
+    </div>
+    <button class="icon-btn" id="theme-toggle" type="button" title="Toggle light / dark" aria-label="Toggle theme">◐</button>
+  </div>
+</header>
+
+<div id="banner" class="banner" hidden>
+  <span class="banner-icon" aria-hidden="true">!</span>
+  <div class="banner-body"><strong id="banner-title"></strong><span id="banner-text"></span></div>
+  <button class="banner-close" id="banner-close" type="button" aria-label="Dismiss">×</button>
+</div>
+
+<nav class="tabs" id="tabs" role="tablist" aria-label="Tools"></nav>
+
+<main class="workspace">
+  <section class="pane pane-input">
+    <div class="pane-head">
+      <div>
+        <h2 id="tool-title">…</h2>
+        <p class="pane-sub" id="tool-blurb"></p>
+      </div>
+    </div>
+
+    <textarea
+      id="input"
+      class="input-area"
+      spellcheck="false"
+      autocomplete="off"
+      placeholder="Paste content here…"
+      aria-label="Tool input"></textarea>
+
+    <div class="pane-foot">
+      <div class="actions">
+        <button class="btn btn-primary" id="run-btn" type="button">
+          <span id="run-label">Run</span>
+          <kbd>⌘↵</kbd>
+        </button>
+        <button class="btn" id="sample-btn" type="button" title="Load a realistic sample input">Load sample</button>
+        <button class="btn btn-quiet" id="clear-btn" type="button">Clear</button>
+      </div>
+      <span class="counter" id="char-count">0 chars</span>
+    </div>
+    <p class="sample-note" id="sample-note"></p>
+  </section>
+
+  <section class="pane pane-output">
+    <div class="pane-head">
+      <h2>Output</h2>
+      <div class="out-actions">
+        <span class="stats" id="stats"></span>
+        <button class="btn btn-quiet" id="copy-btn" type="button" disabled>Copy</button>
+        <button class="btn btn-quiet" id="download-btn" type="button" disabled>Download .md</button>
+      </div>
+    </div>
+
+    <div class="output-scroll">
+      <div id="output" class="markdown-body">
+        <div class="empty-state">
+          <p class="empty-title">Nothing yet.</p>
+          <p>Pick a tool, paste something in, and hit <strong>Run</strong>.</p>
+          <p class="empty-hint">No input handy? <button class="linklike" id="empty-sample">Load the sample</button> for this tool.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <span>No database · no auth · no persistence · one outbound call, to Groq</span>
+  <span class="footer-links">
+    <a href="/docs" target="_blank" rel="noopener">API docs</a>
+    <a href="/api/models" target="_blank" rel="noopener">Live model list</a>
+  </span>
+</footer>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
