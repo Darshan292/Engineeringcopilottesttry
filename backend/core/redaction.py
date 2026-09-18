@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import math
 import re
+import bisect
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 
 PLACEHOLDER_RE = re.compile(r"\[\[REDACTED:([A-Z_]+):(\d+)\]\]")
 
@@ -139,6 +141,74 @@ class RedactionPolicy:
         if sensitivity is Sensitivity.NETWORK:
             return not self.redact_public_ips
         return False
+
+
+@lru_cache(maxsize=1)
+def _custom_rules_cached(spec: str) -> tuple[Rule, ...]:
+    """Compile once per distinct spec.
+
+    `redact()` runs on every request over inputs up to megabytes; recompiling
+    the operator's patterns each time would be pure waste. Keyed on the raw
+    spec so a changed environment variable still takes effect on reload.
+    """
+    return _parse_custom_rules(spec)
+
+
+def load_custom_rules() -> tuple[Rule, ...]:
+    import os
+
+    return _custom_rules_cached(os.getenv("REDACTION_PATTERNS", ""))
+
+
+def _parse_custom_rules(raw: str) -> tuple[Rule, ...]:
+    """Operator-supplied patterns from REDACTION_PATTERNS.
+
+    Format: `NAME=<regex>` entries separated by `;;`. Every organisation has
+    identifier shapes this module has never heard of -- internal ticket
+    formats, employee IDs, customer account numbers, proprietary project
+    codenames. A detector that only knows public credential formats is not a
+    DLP solution, and this is the seam that lets it get closer to one without
+    a code change.
+
+    A malformed pattern is skipped with a warning rather than crashing startup:
+    failing to boot because of a bad regex is worse than running with one fewer
+    rule, and the startup log names it.
+    """
+    import logging
+
+    if not raw.strip():
+        return ()
+
+    log = logging.getLogger("copilot.redaction")
+    rules: list[Rule] = []
+    for entry in raw.split(";;"):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        name, _, pattern = entry.partition("=")
+        name = name.strip().upper().replace(" ", "_") or "CUSTOM"
+        try:
+            compiled = re.compile(pattern.strip())
+        except re.error as exc:
+            log.warning("Ignoring invalid REDACTION_PATTERNS entry %r: %s", name, exc)
+            continue
+        rules.append(Rule(f"CUSTOM_{name}", Sensitivity.CREDENTIAL, compiled))
+    if rules:
+        log.info("Loaded %d custom redaction pattern(s): %s", len(rules), [r.kind for r in rules])
+    return tuple(rules)
+
+
+def fail_closed() -> bool:
+    """When true, a request carrying credentials is refused rather than redacted.
+
+    Redaction is best-effort pattern matching, and best-effort is the wrong
+    posture for some material. An operator who would rather lose the request
+    than risk an unrecognised secret shape reaching a third party sets
+    REDACTION_FAIL_CLOSED=true, and any detected credential becomes a refusal.
+    """
+    import os
+
+    return (os.getenv("REDACTION_FAIL_CLOSED", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 # Policy presets. Logs and transcripts need different things kept.
@@ -269,14 +339,32 @@ def redact(text: str, policy: RedactionPolicy = POLICY_STRICT) -> RedactionRepor
         return RedactionReport(text=text or "")
 
     spans: list[tuple[int, int, Rule, str]] = []
+
+    # `claimed` is kept sorted by start and holds mutually non-overlapping
+    # intervals, so an overlap test is two bisect lookups rather than a scan of
+    # everything claimed so far. The scan version was O(matches^2): an input
+    # with thousands of hits -- a log full of tokens, or an operator pattern
+    # that matches every line -- took quadratic time inside the security layer,
+    # which is a denial-of-service vector in the component meant to prevent one.
     claimed: list[tuple[int, int]] = []
 
     def overlaps(start: int, end: int) -> bool:
-        return any(not (end <= s or start >= e) for s, e in claimed)
+        index = bisect.bisect_right(claimed, (start, end))
+        if index > 0 and claimed[index - 1][1] > start:
+            return True
+        return index < len(claimed) and claimed[index][0] < end
 
-    for rule in RULES:
+    def commit(accepted: list[tuple[int, int]]) -> None:
+        if accepted:
+            claimed.extend(accepted)
+            claimed.sort()
+
+    # Operator patterns run first: an organisation's own identifier shapes are
+    # more specific than the generic detectors and should win the span.
+    for rule in (*load_custom_rules(), *RULES):
         if policy.allows(rule.sensitivity):
             continue
+        accepted: list[tuple[int, int]] = []
         for match in rule.pattern.finditer(text):
             start, end = match.span(rule.group)
             value = match.group(rule.group)
@@ -285,10 +373,12 @@ def redact(text: str, policy: RedactionPolicy = POLICY_STRICT) -> RedactionRepor
             if not _accept(rule, value, text, start):
                 continue
             spans.append((start, end, rule, value))
-            claimed.append((start, end))
+            accepted.append((start, end))
+        commit(accepted)
 
     if policy.entropy_scan:
         entropy_rule = Rule("HIGH_ENTROPY_SECRET", Sensitivity.CREDENTIAL, _ENTROPY_CANDIDATE)
+        accepted = []
         for match in _ENTROPY_CANDIDATE.finditer(text):
             start, end = match.span()
             value = match.group()
@@ -299,7 +389,8 @@ def redact(text: str, policy: RedactionPolicy = POLICY_STRICT) -> RedactionRepor
             if not _ENTROPY_CONTEXT.search(text[max(0, start - 40) : start]):
                 continue
             spans.append((start, end, entropy_rule, value))
-            claimed.append((start, end))
+            accepted.append((start, end))
+        commit(accepted)
 
     if not spans:
         return RedactionReport(text=text)

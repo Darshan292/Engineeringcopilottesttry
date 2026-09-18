@@ -30,6 +30,7 @@ from __future__ import annotations
 import math
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 
 # Mirrors the pre-tokenization step in GPT-family BPE: contractions, then runs
@@ -181,16 +182,107 @@ CONTEXT_WINDOWS: dict[str, int] = {
 DEFAULT_CONTEXT_WINDOW = 8_192
 
 
-def context_window_for(model: str) -> int:
+class ModelRegistry:
+    """Runtime model metadata, treated as authoritative over the static table.
+
+    The hardcoded `CONTEXT_WINDOWS` above is a cold-start fallback and nothing
+    more. Providers change context windows, retire models and add new ones, so
+    a table baked into source is wrong the moment it ships -- and being wrong
+    in the optimistic direction means requests that fail at the provider after
+    the whole pipeline has already run.
+
+    `GET /v1/models` reports `context_window` per model. This caches what the
+    provider actually said, and `context_window_for` prefers it. The cache is
+    refreshed opportunistically; a stale entry is still better than a guess,
+    and an unknown model still falls back to the conservative default rather
+    than assuming a large window.
+    """
+
+    def __init__(self, ttl_seconds: float = 3600.0, failure_backoff: float = 300.0) -> None:
+        self._lock = threading.Lock()
+        self._windows: dict[str, int] = {}
+        self._fetched_at: float = 0.0
+        self._attempted_at: float = 0.0
+        self._ttl = ttl_seconds
+        self._failure_backoff = failure_backoff
+
+    def note_attempt(self) -> None:
+        """Record that a refresh was tried, successful or not.
+
+        Without this, an endpoint that does not serve /models -- a local
+        llama.cpp build, a proxy, anything non-Groq -- means every single
+        request pays a failing round trip forever, because the cache never
+        fills and therefore never stops looking stale.
+        """
+        with self._lock:
+            self._attempted_at = time.time()
+
+    @property
+    def should_refresh(self) -> bool:
+        now = time.time()
+        with self._lock:
+            if self._windows and (now - self._fetched_at) <= self._ttl:
+                return False
+            # Back off after a failed attempt instead of retrying every request.
+            return (now - self._attempted_at) > self._failure_backoff
+
+    def update(self, models: list[dict]) -> int:
+        """Record what the provider reported. Returns how many carried a window."""
+        recorded = 0
+        with self._lock:
+            for entry in models:
+                model_id = entry.get("id")
+                window = entry.get("context_window")
+                if model_id and isinstance(window, int) and window > 0:
+                    self._windows[str(model_id)] = window
+                    recorded += 1
+            self._fetched_at = time.time()
+            self._attempted_at = self._fetched_at
+        return recorded
+
+    def get(self, model: str) -> int | None:
+        with self._lock:
+            return self._windows.get(model)
+
+    @property
+    def is_stale(self) -> bool:
+        with self._lock:
+            return (time.time() - self._fetched_at) > self._ttl
+
+    @property
+    def has_data(self) -> bool:
+        with self._lock:
+            return bool(self._windows)
+
+    def public(self) -> dict:
+        with self._lock:
+            return {
+                "models_known": len(self._windows),
+                "age_seconds": round(time.time() - self._fetched_at, 1) if self._fetched_at else None,
+                "stale": (time.time() - self._fetched_at) > self._ttl if self._fetched_at else True,
+            }
+
+
+registry = ModelRegistry()
+
+
+def context_window_for(model: str) -> tuple[int, str]:
+    """Return (window, source). Runtime metadata wins over the static table."""
+    live = registry.get(model)
+    if live:
+        return live, "provider"
+
     if model in CONTEXT_WINDOWS:
-        return CONTEXT_WINDOWS[model]
+        return CONTEXT_WINDOWS[model], "static-table"
+
     # Match on the bare name when the operator uses a provider prefix we do
     # not have listed, e.g. "groq/qwen/qwen3.6-27b".
     tail = model.rsplit("/", 1)[-1]
     for known, window in CONTEXT_WINDOWS.items():
         if known.rsplit("/", 1)[-1] == tail:
-            return window
-    return DEFAULT_CONTEXT_WINDOW
+            return window, "static-table (suffix match)"
+
+    return DEFAULT_CONTEXT_WINDOW, "conservative default (model unknown)"
 
 
 @dataclass
@@ -204,6 +296,9 @@ class TokenBudget:
     safety_margin: int
     available_for_input: int
     calibration: dict = field(default_factory=dict)
+    # Where the context window came from. A conservative default means the
+    # budget is a guess, and callers surface that.
+    window_source: str = "static-table"
 
     def fits(self, estimated_input_tokens: int) -> bool:
         return estimated_input_tokens <= self.available_for_input
@@ -216,6 +311,7 @@ class TokenBudget:
             "reserved_for_system": self.reserved_for_system,
             "safety_margin": self.safety_margin,
             "available_for_input": self.available_for_input,
+            "window_source": self.window_source,
             "calibration": self.calibration,
         }
 
@@ -228,7 +324,10 @@ def build_budget(
     context_window: int | None = None,
 ) -> TokenBudget:
     """Compute the usable input budget for one request."""
-    window = context_window or context_window_for(model)
+    if context_window:
+        window, source = context_window, "explicit"
+    else:
+        window, source = context_window_for(model)
     cal = calibrator.for_model(model)
 
     system_tokens = cal.apply(estimate_tokens(system_prompt)) + 16
@@ -247,4 +346,5 @@ def build_budget(
         safety_margin=margin,
         available_for_input=max(0, available),
         calibration=cal.public(),
+        window_source=source,
     )

@@ -21,26 +21,40 @@ render from.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 
 from ..core import injection
 from ..core.chunking import plan_context
 from ..core.detect import detect_input_kind, detect_language, mismatch_warning
-from ..core.redaction import POLICY_CODE, POLICY_LOGS, POLICY_STRICT, assert_no_secrets, redact
+from ..core.redaction import (
+    POLICY_CODE,
+    POLICY_LOGS,
+    POLICY_STRICT,
+    assert_no_secrets,
+    fail_closed,
+    redact,
+)
 from ..core.tokens import build_budget
 from ..groq_client import GroqError
 from ..parsers.code import parse_code
 from ..parsers.logs import parse_logs
 from ..parsers.routes import parse_routes
 from ..parsers.transcript import parse_transcript
-from ..prompts import TOOL_PROMPTS, build_user_message
+from ..prompts import (
+    TOOL_PROMPTS,
+    build_reduce_message,
+    build_reduce_system_prompt,
+    build_user_message,
+)
 from ..render import markdown as render
 from ..validation import grounding as ground
 from ..validation.confidence import compute_confidence
 from ..validation.openapi import validate_openapi
 from ..validation.python_exec import run_python_tests
 from ..validation.schemas import APIDocOutput, PostmortemOutput, RCAOutput, UnitTestOutput
+from .base import StructuredResult as StructuredResultLike
 from .base import Trace, call_structured, timed
 
 
@@ -66,6 +80,16 @@ _POLICIES = {
 }
 
 
+async def _preprocess_async(tool: str, raw: str, trace: Trace) -> tuple[str, dict, list[str]]:
+    """Run preprocessing off the event loop.
+
+    Redaction scans ~20 regexes over the whole input and the injection scan
+    another 7. On a multi-megabyte paste that is seconds of CPU, and doing it
+    inline blocks every other request in the process.
+    """
+    return await asyncio.to_thread(_preprocess, tool, raw, trace)
+
+
 def _preprocess(tool: str, raw: str, trace: Trace) -> tuple[str, dict, list[str]]:
     """Redact, classify and defang. Returns (safe_text, diagnostics, warnings)."""
     warnings: list[str] = []
@@ -75,6 +99,18 @@ def _preprocess(tool: str, raw: str, trace: Trace) -> tuple[str, dict, list[str]
         redaction = redact(raw, _POLICIES[tool])
         diagnostics["redaction"] = redaction.public()
         stage.summary = {"redacted": redaction.redacted_count}
+        if redaction.has_credentials and fail_closed():
+            raise GroqError(
+                f"Refusing to process: this input contains credentials "
+                f"({redaction.counts_by_kind()}) and REDACTION_FAIL_CLOSED is enabled.",
+                status=422,
+                hint=(
+                    "Redaction is pattern matching and cannot guarantee it recognises every "
+                    "secret shape. This deployment is configured to refuse rather than rely "
+                    "on it. Remove the credentials from the input, or set "
+                    "REDACTION_FAIL_CLOSED=false to accept redaction as sufficient."
+                ),
+            )
         if redaction.has_credentials:
             warnings.append(
                 f"{redaction.redacted_count} secret(s) or personal identifier(s) were removed "
@@ -128,17 +164,38 @@ async def _run(
     extra_validators: list | None = None,
     context_note: str = "",
 ):
-    """Budget, plan context and make the structured call."""
+    """Budget, plan context, then run either a single call or map-reduce."""
     system_prompt = TOOL_PROMPTS[tool]
 
+    from ..config import settings
+    from ..groq_client import refresh_model_registry_if_stale
+
+    # Context windows come from the provider where possible. One cheap GET per
+    # hour beats budgeting against a table that was correct when it was written.
+    with timed(trace, "model_metadata") as stage:
+        refreshed = await refresh_model_registry_if_stale()
+        stage.summary = {"refreshed": refreshed}
+
     with timed(trace, "budget") as stage:
-        from ..config import settings
-
         budget = build_budget(model or settings.groq_model, system_prompt, settings.max_tokens)
-        stage.summary = {"available_for_input": budget.available_for_input}
+        stage.summary = {
+            "available_for_input": budget.available_for_input,
+            "window_source": budget.window_source,
+        }
 
+    if budget.window_source.startswith("conservative"):
+        warnings.append(
+            f"The context window for '{model or settings.groq_model}' is not known to this "
+            f"deployment and could not be read from the provider, so a conservative "
+            f"{budget.context_window:,}-token window was assumed. Large inputs may be "
+            f"compressed or refused more aggressively than necessary."
+        )
+
+    # Parsing and planning are CPU-bound and run on multi-megabyte inputs.
+    # Doing that on the event loop stalls every other request, including
+    # /api/health, for the whole duration.
     with timed(trace, "plan_context") as stage:
-        plan = plan_context(ir, budget)
+        plan = await asyncio.to_thread(plan_context, ir, budget)
         stage.summary = {"strategy": plan.strategy, "chunks": len(plan.chunks)}
 
     if plan.strategy == "reject":
@@ -147,29 +204,101 @@ async def _run(
     if plan.strategy != "full":
         warnings.append(plan.reason)
 
-    # Single-pass covers full and summary. Map-reduce is handled by the caller
-    # only for tools where partial analysis is meaningful; for the others the
-    # planner's chunk cap has already turned oversize input into a rejection.
-    body = plan.chunks[0].body if plan.chunks else facts
+    # --- single pass: full or compressed -----------------------------------
+    if plan.strategy != "map_reduce":
+        chunk = plan.chunks[0]
+        result = await call_structured(
+            system_prompt,
+            build_user_message(
+                tool,
+                chunk.body,
+                # Only what this call actually contains. Declaring the whole
+                # input's ID space would let the model cite a line it never
+                # saw, and that citation would pass the grounding check.
+                evidence_ids=chunk.item_ids,
+                context_note=context_note or (plan.reason if plan.strategy != "full" else ""),
+                warnings=warnings,
+            ),
+            schema,
+            trace=trace,
+            model=model,
+            temperature=temperature,
+            extra_validators=extra_validators,
+        )
+        return result, plan
 
-    user_message = build_user_message(
-        tool,
-        body,
-        evidence_ids=sorted(ir.evidence_ids()),
-        context_note=context_note or (plan.reason if plan.strategy != "full" else ""),
-        warnings=warnings,
-    )
+    # --- map-reduce ---------------------------------------------------------
+    # Each part is analysed against only its own content and its own ID space,
+    # then a combine step reasons over the partial findings plus the global
+    # overview. Without this, everything after the first chunk was silently
+    # discarded while the response still claimed to have analysed the input.
+    partials: list[str] = []
+    cited_ids: set[str] = set()
+    accumulated: StructuredResultLike | None = None
 
-    result = await call_structured(
-        system_prompt,
-        user_message,
+    for chunk in plan.chunks:
+        part = await call_structured(
+            system_prompt,
+            build_user_message(
+                tool,
+                chunk.body,
+                evidence_ids=chunk.item_ids,
+                context_note=(
+                    f"This is part {chunk.index + 1} of {chunk.total}. Analyse only what is "
+                    f"present here; a combining step will resolve anything that spans parts."
+                ),
+                warnings=warnings,
+            ),
+            schema,
+            trace=trace,
+            model=model,
+            temperature=temperature,
+            stage_name=f"map.part{chunk.index + 1}",
+            # Domain validators (executing tests, validating OpenAPI) apply to
+            # the final answer, not to a partial view of the input.
+            extra_validators=None,
+        )
+        partials.append(part.value.model_dump_json(indent=None))
+        cited_ids.update(_cited_ids(tool, part.value))
+        accumulated = part if accumulated is None else accumulated.merge(part)
+
+    with timed(trace, "reduce") as stage:
+        stage.summary = {"parts": len(partials), "distinct_ids_cited": len(cited_ids)}
+
+    reduced = await call_structured(
+        build_reduce_system_prompt(tool),
+        build_reduce_message(
+            tool,
+            plan.skeleton,
+            partials,
+            evidence_ids=sorted(cited_ids),
+        ),
         schema,
         trace=trace,
         model=model,
         temperature=temperature,
+        stage_name="reduce",
         extra_validators=extra_validators,
     )
-    return result, plan
+
+    warnings.append(
+        f"This input was analysed in {len(plan.chunks)} parts and then combined "
+        f"({len(plan.chunks) + 1} model calls). No single call saw the whole input, so "
+        f"relationships spanning parts rest on the combining step rather than on direct "
+        f"observation. Confidence is reduced accordingly."
+    )
+
+    final = accumulated.merge(reduced) if accumulated else reduced
+    return final, plan
+
+
+def _cited_ids(tool: str, value) -> set[str]:
+    """Every evidence ID a partial answer referenced."""
+    getter = getattr(value, "all_evidence_ids", None)
+    if callable(getter):
+        return {i for i in getter() if i}
+    # Tools whose schema carries no evidence IDs (tests, docs) contribute none.
+    return set()
 
 
 # --- log / RCA ------------------------------------------------------------
@@ -177,10 +306,10 @@ async def _run(
 
 async def run_log_rca(raw: str, *, model=None, temperature=None, request_id=None) -> PipelineResult:
     trace = Trace(request_id or uuid.uuid4().hex[:12])
-    safe, diagnostics, warnings = _preprocess("log-rca", raw, trace)
+    safe, diagnostics, warnings = await _preprocess_async("log-rca", raw, trace)
 
     with timed(trace, "parse") as stage:
-        ir = parse_logs(safe)
+        ir = await asyncio.to_thread(parse_logs, safe)
         stage.summary = {"lines": ir.total_lines, "templates": len(ir.templates)}
     diagnostics["parse"] = ir.stats()
 
@@ -233,10 +362,10 @@ async def run_log_rca(raw: str, *, model=None, temperature=None, request_id=None
 
 async def run_postmortem(raw: str, *, model=None, temperature=None, request_id=None) -> PipelineResult:
     trace = Trace(request_id or uuid.uuid4().hex[:12])
-    safe, diagnostics, warnings = _preprocess("postmortem", raw, trace)
+    safe, diagnostics, warnings = await _preprocess_async("postmortem", raw, trace)
 
     with timed(trace, "parse") as stage:
-        ir = parse_transcript(safe)
+        ir = await asyncio.to_thread(parse_transcript, safe)
         stage.summary = {"utterances": len(ir.utterances), "participants": len(ir.speakers)}
     diagnostics["parse"] = ir.stats()
 
@@ -320,11 +449,11 @@ async def run_postmortem(raw: str, *, model=None, temperature=None, request_id=N
 
 async def run_unit_tests(raw: str, *, model=None, temperature=None, request_id=None) -> PipelineResult:
     trace = Trace(request_id or uuid.uuid4().hex[:12])
-    safe, diagnostics, warnings = _preprocess("unit-tests", raw, trace)
+    safe, diagnostics, warnings = await _preprocess_async("unit-tests", raw, trace)
 
     with timed(trace, "parse") as stage:
         language = detect_language(safe).value
-        ir = parse_code(safe, language)
+        ir = await asyncio.to_thread(parse_code, safe, language)
         stage.summary = {"language": ir.language, "functions": len(ir.all_functions())}
     diagnostics["parse"] = ir.stats()
 
@@ -335,6 +464,14 @@ async def run_unit_tests(raw: str, *, model=None, temperature=None, request_id=N
         )
     if not ir.all_functions():
         warnings.append("No functions or methods were extracted; there may be nothing to test.")
+    elif ir.confidence < 0.6:
+        warnings.append(
+            f"Structural extraction for {ir.language} uses {ir.parser}, which recovers "
+            f"signatures but not boundary conditions, raised exceptions or dependency "
+            f"boundaries (confidence {ir.confidence:.0%}). The model is working from a "
+            f"weaker picture than it would for Python, so coverage claims below are less "
+            f"reliable. Review the generated cases rather than trusting the coverage figure."
+        )
 
     boundaries = [c for f in ir.all_functions() for c in f.comparisons]
     defined = [f.name for f in ir.all_functions()] + [c.name for c in ir.classes]
@@ -343,7 +480,7 @@ async def run_unit_tests(raw: str, *, model=None, temperature=None, request_id=N
     # and a failure feeds the same repair loop as a schema error.
     execution_holder: dict = {}
 
-    def check_execution(value) -> str:
+    async def check_execution(value) -> str:
         if ir.language != "python" or not value.test_code.strip():
             return ""
         if ir.syntax_error:
@@ -351,7 +488,8 @@ async def run_unit_tests(raw: str, *, model=None, temperature=None, request_id=N
             # Retrying would spend the whole repair budget proving that.
             execution_holder["report"] = None
             return ""
-        report, notes = run_python_tests(safe, value.test_code, defined)
+        # subprocess.run blocks for up to the timeout; off the loop it goes.
+        report, notes = await asyncio.to_thread(run_python_tests, safe, value.test_code, defined)
         execution_holder["report"] = report
         execution_holder["notes"] = notes
         if report.skipped_reason:
@@ -411,10 +549,10 @@ async def run_unit_tests(raw: str, *, model=None, temperature=None, request_id=N
 
 async def run_api_docs(raw: str, *, model=None, temperature=None, request_id=None) -> PipelineResult:
     trace = Trace(request_id or uuid.uuid4().hex[:12])
-    safe, diagnostics, warnings = _preprocess("api-docs", raw, trace)
+    safe, diagnostics, warnings = await _preprocess_async("api-docs", raw, trace)
 
     with timed(trace, "parse") as stage:
-        ir = parse_routes(safe)
+        ir = await asyncio.to_thread(parse_routes, safe)
         stage.summary = {"framework": ir.framework, "routes": len(ir.routes)}
     diagnostics["parse"] = ir.stats()
 
@@ -422,6 +560,13 @@ async def run_api_docs(raw: str, *, model=None, temperature=None, request_id=Non
         warnings.append(
             "No routes could be extracted. The model received the raw source, so the OpenAPI "
             "cross-check cannot verify that the spec matches the code."
+        )
+    elif "regex" in ir.parser:
+        warnings.append(
+            f"Routes were extracted with {ir.parser} rather than a real parser, so parameter "
+            f"types, request bodies and error paths are likely incomplete. The OpenAPI "
+            f"cross-check can only verify against what was extracted, so a missing route "
+            f"here will not be reported as missing."
         )
 
     openapi_holder: dict = {}

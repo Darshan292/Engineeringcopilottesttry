@@ -22,6 +22,7 @@ what makes concurrent requests debuggable at all.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
 import time
@@ -174,6 +175,22 @@ class StructuredResult:
     elapsed_ms: int = 0
     raw_last: str = ""
 
+    def merge(self, other: "StructuredResult") -> "StructuredResult":
+        """Fold another call's cost into this one, for multi-call runs."""
+        merged = StructuredResult(
+            value=other.value,
+            attempts=self.attempts + other.attempts,
+            repairs=self.repairs + other.repairs,
+            usage={
+                key: (self.usage.get(key, 0) or 0) + (other.usage.get(key, 0) or 0)
+                for key in {"prompt_tokens", "completion_tokens", "total_tokens"}
+            },
+            model=other.model or self.model,
+            elapsed_ms=self.elapsed_ms + other.elapsed_ms,
+            raw_last=other.raw_last,
+        )
+        return merged
+
 
 async def call_structured(
     system_prompt: str,
@@ -192,6 +209,9 @@ async def call_structured(
     `extra_validators` are callables taking the validated object and returning
     an error string (or empty). They participate in the same repair loop, which
     is how test-execution failures and OpenAPI errors get a second chance.
+    They may be async: a validator that shells out (running generated tests,
+    for instance) must not do so on the event loop, so it returns a coroutine
+    and is awaited here.
     """
     messages_user = user_content
     repairs: list[str] = []
@@ -239,6 +259,8 @@ async def call_structured(
                     domain_errors = []
                     for validator in extra_validators or []:
                         message = validator(value)
+                        if inspect.isawaitable(message):
+                            message = await message
                         if message:
                             domain_errors.append(message)
                     if not domain_errors:

@@ -17,14 +17,27 @@ Three outcomes, all useful and all different:
   asserted.
 
 Safety. This executes model-generated code, which is a real risk and is treated
-as one. It runs in a subprocess under a wall-clock timeout, in an isolated
-temp directory that is deleted afterwards, with `-I` so the ambient environment
-does not leak in, with `-p no:cacheprovider` so nothing is written back, and
-under CPU and address-space limits via `setrlimit` where the platform supports
-it. That is meaningful containment, not a sandbox: it does not block network
-access or filesystem writes outside the temp directory. It is therefore
-**opt-out** via `ENABLE_TEST_EXECUTION=false`, and anyone running untrusted
-input through this should turn it off or run the service in a container.
+as one. Containment, strongest first:
+
+1. **Kernel sandbox when available.** If `bwrap` (bubblewrap) is on PATH the
+   subprocess runs inside it with an unshared network namespace, a read-only
+   root, and only the work directory writable. That is genuine isolation:
+   network egress and writes outside the sandbox are impossible, not merely
+   discouraged. `firejail` is used as a second choice.
+2. **In-process interception otherwise.** A generated `sitecustomize.py` is
+   imported before any test code and replaces `socket.socket`, `socket.create_connection`
+   and the `subprocess` spawn functions with versions that raise. This stops
+   the realistic failure — generated code that calls an API or pip-installs a
+   package — though a determined escape via `ctypes` remains possible.
+3. **Always.** Wall-clock timeout, isolated temp directory deleted afterwards,
+   `-I` so the ambient environment does not leak in, `-p no:cacheprovider`,
+   a scrubbed environment, and CPU / address-space / process-count limits via
+   `setrlimit`.
+
+Layer 2 is mitigation, not a security boundary, and the report says which layer
+was in force so nobody has to guess. Execution remains opt-out via
+`ENABLE_TEST_EXECUTION=false`; for untrusted input, install bubblewrap or run
+the whole service in a container.
 """
 
 from __future__ import annotations
@@ -43,9 +56,44 @@ _CPU_SECONDS = 20
 _ADDRESS_SPACE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 
+# Installed as the work directory's conftest.py, which pytest imports after its
+# own plugins are loaded but before any generated test module. Patching earlier
+# (via sitecustomize) breaks pytest's entry-point plugin loading, which needs
+# these primitives itself.
+#
+# Removes the two capabilities generated test code realistically reaches for:
+# network calls and spawning processes (pip install, curl). Not a security
+# boundary -- ctypes can undo it -- but it turns the common accident into a
+# clear error instead of silent egress.
+_CONFTEST = """
+import socket as _socket
+import subprocess as _subprocess
+
+
+class _Blocked(RuntimeError):
+    pass
+
+
+def _deny(*_args, **_kwargs):
+    raise _Blocked(
+        "Network and process spawning are disabled while validating generated tests. "
+        "Mock this boundary instead of calling it."
+    )
+
+
+_socket.socket = _deny
+_socket.create_connection = _deny
+_subprocess.Popen = _deny
+_subprocess.run = _deny
+_subprocess.call = _deny
+_subprocess.check_output = _deny
+"""
+
+
 @dataclass
 class ExecutionReport:
     ran: bool = False
+    isolation: str = "none"
     skipped_reason: str | None = None
     syntax_ok: bool = False
     collected: int = 0
@@ -92,12 +140,52 @@ class ExecutionReport:
             "errors": self.errors,
             "duration_seconds": round(self.duration_seconds, 2),
             "collection_error": self.collection_error,
+            "isolation": self.isolation,
             "failures": self.failure_details[:5],
         }
 
 
 def execution_enabled() -> bool:
     return os.getenv("ENABLE_TEST_EXECUTION", "true").strip().lower() not in {"false", "0", "no", "off"}
+
+
+def _sandbox_wrapper(workdir: Path) -> tuple[list[str], str]:
+    """Return (argv prefix, isolation label) for the strongest available sandbox."""
+    if os.name != "posix":
+        return [], "in-process interception (no kernel sandbox on this platform)"
+
+    if shutil.which("bwrap"):
+        return (
+            [
+                "bwrap",
+                "--unshare-net",          # no network namespace: egress impossible
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--die-with-parent",
+                "--ro-bind", "/usr", "/usr",
+                "--ro-bind", "/lib", "/lib",
+                *(["--ro-bind", "/lib64", "/lib64"] if Path("/lib64").exists() else []),
+                *(["--ro-bind", "/bin", "/bin"] if Path("/bin").exists() else []),
+                *(["--ro-bind", "/etc/alternatives", "/etc/alternatives"]
+                  if Path("/etc/alternatives").exists() else []),
+                "--ro-bind", sys.prefix, sys.prefix,
+                "--bind", str(workdir), str(workdir),
+                "--proc", "/proc",
+                "--dev", "/dev",
+                "--chdir", str(workdir),
+                "--",
+            ],
+            "bubblewrap (network namespace unshared, root read-only)",
+        )
+
+    if shutil.which("firejail"):
+        return (
+            ["firejail", "--quiet", "--net=none", "--private-tmp", f"--whitelist={workdir}", "--"],
+            "firejail (network disabled)",
+        )
+
+    return [], "in-process interception (install bubblewrap for kernel isolation)"
 
 
 def _limit_resources() -> None:  # pragma: no cover - child process only
@@ -117,6 +205,23 @@ _SUMMARY_RE = re.compile(r"(\d+) (passed|failed|error|errors|skipped)")
 # be reconstructed from the summary; without this every run reported collected=0
 # and the repair feedback said "no tests" even when tests had failed.
 _COLLECTED_RE = re.compile(r"collected (\d+) item")
+
+
+def _module_is_importable(module: str) -> bool:
+    """True when `module` resolves to something real in this interpreter.
+
+    Stdlib and installed packages must never be rewritten; only the invented
+    module name the model imported the source under should be redirected.
+    """
+    root = module.split(".")[0]
+    if root in getattr(sys, "stdlib_module_names", frozenset()):
+        return True
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec(root) is not None
+    except (ImportError, ValueError, ModuleNotFoundError, AttributeError):
+        return False
 
 
 def _guess_module_name(source: str) -> str:
@@ -143,7 +248,9 @@ def _rewrite_imports(test_code: str, defined_names: list[str], module_name: str)
     # only when every imported name is something the source actually defines.
     def replace(match: re.Match) -> str:
         module, names = match.group(1), match.group(2)
-        if module == module_name:
+        if module == module_name or _module_is_importable(module):
+            # A real module is never hijacked, even if the source happens to
+            # define a symbol of the same name.
             return match.group(0)
         imported = [n.strip().split(" as ")[0].strip() for n in names.split(",")]
         if imported and all(n in defined_names for n in imported if n and n != "*"):
@@ -154,11 +261,15 @@ def _rewrite_imports(test_code: str, defined_names: list[str], module_name: str)
     rewritten = re.sub(r"^from ([\w.]+) import ([^\n]+)$", replace, rewritten, flags=re.M)
 
     # import <module>  ->  import source_under_test as <module>
+    #
+    # Only for modules that do not actually exist. An earlier version rewrote
+    # every bare import, so a generated test containing `import socket` or
+    # `import decimal` was silently repointed at the source module and failed
+    # with a bogus AttributeError -- which then consumed the repair budget
+    # proving that a perfectly good test "did not run".
     def replace_plain(match: re.Match) -> str:
         module = match.group(1)
-        if module in {"pytest", "unittest", "sys", "os", "re", "json", "math", "datetime", "typing", module_name}:
-            return match.group(0)
-        if module.split(".")[0] in {"mock", "unittest"}:
+        if module == module_name or _module_is_importable(module):
             return match.group(0)
         notes.append(f"rewrote 'import {module}' to '{module_name}'")
         return f"import {module_name} as {module}"
@@ -197,6 +308,10 @@ def run_python_tests(
     try:
         (workdir / f"{module_name}.py").write_text(source_code, encoding="utf-8")
         (workdir / "test_generated.py").write_text(rewritten, encoding="utf-8")
+        (workdir / "conftest.py").write_text(_CONFTEST, encoding="utf-8")
+
+        wrapper, isolation = _sandbox_wrapper(workdir)
+        report.isolation = isolation
 
         env = {
             "PATH": os.environ.get("PATH", ""),
@@ -215,6 +330,7 @@ def run_python_tests(
         try:
             completed = subprocess.run(
                 [
+                    *wrapper,
                     sys.executable, "-I", "-m", "pytest",
                     "test_generated.py",
                     "-p", "no:cacheprovider",

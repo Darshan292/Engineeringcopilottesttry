@@ -302,4 +302,39 @@ async def list_models() -> list[dict[str, Any]]:
         if m.get("id")
     ]
     models.sort(key=lambda m: str(m["id"]))
+
+    # Treat what the provider reports as authoritative over the static table.
+    # Windows change, models are retired and added, and being optimistically
+    # wrong means a request that fails upstream after the whole local pipeline
+    # has already run.
+    try:
+        from .core.tokens import registry
+
+        registry.update(models)
+    except Exception:
+        pass
+
     return models
+
+
+async def refresh_model_registry_if_stale() -> bool:
+    """Opportunistically refresh runtime model metadata. Never raises.
+
+    Called before budgeting. One cheap GET per hour keeps context windows
+    accurate; a failure just leaves the previous values in place.
+    """
+    from .core.tokens import registry
+
+    if not registry.should_refresh:
+        return False
+    if not settings.has_api_key:
+        return False
+
+    # Mark the attempt before making it, so a failure backs off rather than
+    # repeating on every request for the rest of the process lifetime.
+    registry.note_attempt()
+    try:
+        await list_models()
+        return True
+    except Exception:
+        return False

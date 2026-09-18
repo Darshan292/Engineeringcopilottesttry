@@ -218,15 +218,32 @@ def patch_settings(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def reset_rate_limiter():
-    """Each test starts with a clean limiter, otherwise ordering decides results."""
+def reset_process_state():
+    """Reset every piece of process-global state between tests.
+
+    The pipeline deliberately carries state across requests -- the token
+    calibrator learns from observed usage and the model registry caches what
+    the provider reported -- which is correct at runtime and poisonous in a
+    test suite. A calibrated estimator narrows the safety margin, which changes
+    the computed budget, which changes whether an input chunks or compresses.
+    Without this, a test's result depended on which tests ran before it.
+    """
+    from backend.core.tokens import calibrator, registry
     from backend.governance import limiter
 
-    limiter._minute.clear()
-    limiter._day.clear()
+    def clear():
+        limiter._minute.clear()
+        limiter._day.clear()
+        with calibrator._lock:
+            calibrator._models.clear()
+        with registry._lock:
+            registry._windows.clear()
+            registry._fetched_at = 0.0
+            registry._attempted_at = 0.0
+
+    clear()
     yield
-    limiter._minute.clear()
-    limiter._day.clear()
+    clear()
 
 
 def response_for(tool: str, **overrides) -> dict:

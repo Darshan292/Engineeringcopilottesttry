@@ -124,17 +124,53 @@ class SlidingWindowLimiter:
     nobody assumes it holds across replicas.
     """
 
+    # Every distinct client key allocates two deques that were never reclaimed.
+    # A service reachable by many addresses -- or one behind a proxy that
+    # forwards a varying key -- grows that map without bound, which is a slow
+    # memory leak in the component meant to protect against abuse.
+    _MAX_TRACKED_CLIENTS = 10_000
+    _SWEEP_EVERY = 500
+
     def __init__(self, per_minute: int, per_day: int):
         self.per_minute = per_minute
         self.per_day = per_day
         self._lock = threading.Lock()
         self._minute: dict[str, deque] = defaultdict(deque)
         self._day: dict[str, deque] = defaultdict(deque)
+        self._checks_since_sweep = 0
+
+    def _evict_idle(self, now: float) -> None:
+        """Drop clients with no activity inside the daily window.
+
+        Called under the lock. Cheap because it only runs every N checks, and
+        the daily deque is the authority on whether a client is still relevant.
+        """
+        for key in [k for k, stamps in self._day.items() if not stamps or now - stamps[-1] > 86_400]:
+            self._day.pop(key, None)
+            self._minute.pop(key, None)
+
+        # Hard ceiling in case a burst of distinct keys arrives faster than the
+        # daily window retires them: drop the least recently seen.
+        if len(self._day) > self._MAX_TRACKED_CLIENTS:
+            ordered = sorted(self._day.items(), key=lambda kv: kv[1][-1] if kv[1] else 0)
+            for key, _ in ordered[: len(self._day) - self._MAX_TRACKED_CLIENTS]:
+                self._day.pop(key, None)
+                self._minute.pop(key, None)
+
+    @property
+    def tracked_clients(self) -> int:
+        with self._lock:
+            return len(self._day)
 
     def check(self, client: str) -> tuple[bool, str, int]:
         """Returns (allowed, reason, retry_after_seconds)."""
         now = time.time()
         with self._lock:
+            self._checks_since_sweep += 1
+            if self._checks_since_sweep >= self._SWEEP_EVERY:
+                self._checks_since_sweep = 0
+                self._evict_idle(now)
+
             minute = self._minute[client]
             day = self._day[client]
 

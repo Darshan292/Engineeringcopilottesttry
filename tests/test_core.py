@@ -131,12 +131,75 @@ def test_estimator_never_returns_zero_for_content():
 
 
 def test_unknown_models_fall_back_to_a_small_window():
-    assert context_window_for("qwen/qwen3.6-27b") == 131_072
-    assert context_window_for("something-nobody-has-heard-of") == 8_192
+    window, source = context_window_for("qwen/qwen3.6-27b")
+    assert window == 131_072 and source == "static-table"
+
+    window, source = context_window_for("something-nobody-has-heard-of")
+    assert window == 8_192
+    assert "conservative" in source
 
 
 def test_provider_prefixed_model_names_still_resolve():
-    assert context_window_for("groq/qwen/qwen3.6-27b") == 131_072
+    window, source = context_window_for("groq/qwen/qwen3.6-27b")
+    assert window == 131_072
+    assert "suffix" in source
+
+
+def test_provider_metadata_overrides_the_static_table(monkeypatch):
+    """A table baked into source is wrong the moment a provider changes it."""
+    from backend.core.tokens import ModelRegistry, registry
+
+    fresh = ModelRegistry()
+    monkeypatch.setattr("backend.core.tokens.registry", fresh)
+
+    # Provider disagrees with our hardcoded 131072, and a model we never listed.
+    fresh.update(
+        [
+            {"id": "qwen/qwen3.6-27b", "context_window": 98_304},
+            {"id": "brand-new-model", "context_window": 262_144},
+        ]
+    )
+    assert context_window_for("qwen/qwen3.6-27b") == (98_304, "provider")
+    assert context_window_for("brand-new-model") == (262_144, "provider")
+
+
+def test_registry_ignores_malformed_entries():
+    from backend.core.tokens import ModelRegistry
+
+    fresh = ModelRegistry()
+    recorded = fresh.update(
+        [{"id": "a", "context_window": 1000}, {"id": "b"}, {"id": "c", "context_window": "big"},
+         {"context_window": 5000}, {"id": "d", "context_window": -1}]
+    )
+    assert recorded == 1
+    assert fresh.get("a") == 1000
+    assert fresh.get("b") is None
+
+
+def test_budget_reports_where_its_window_came_from():
+    budget = build_budget("a-model-nobody-has-listed", "sys", 1024)
+    assert budget.window_source.startswith("conservative")
+    assert budget.context_window == 8_192
+
+
+def test_rate_limiter_evicts_idle_clients():
+    """Every distinct client key used to allocate deques that were never freed."""
+    from backend.governance import SlidingWindowLimiter
+
+    limiter = SlidingWindowLimiter(1_000_000, 1_000_000)
+    for i in range(30_000):
+        limiter.check(f"10.{i // 65536}.{i // 256 % 256}.{i % 256}")
+    assert limiter.tracked_clients <= SlidingWindowLimiter._MAX_TRACKED_CLIENTS + 1
+
+
+def test_eviction_does_not_break_limiting():
+    from backend.governance import SlidingWindowLimiter
+
+    limiter = SlidingWindowLimiter(2, 10)
+    assert limiter.check("a")[0]
+    assert limiter.check("a")[0]
+    allowed, reason, retry = limiter.check("a")
+    assert not allowed and "minute" in reason and retry > 0
 
 
 def test_calibration_converges_and_narrows_the_margin():

@@ -80,10 +80,15 @@ are field-split and clustered into templates. Transcripts are anonymized.
 
 **Large inputs are compressed, not truncated.** Repeated log messages collapse
 into templates with counts and first/last occurrence: a 60,000-line log
-compresses about 242x. When it still does not fit, the input is chunked with the
-global overview attached to every chunk, so a cause in part 2 and its effects in
+compresses about 242x. When it still does not fit, the input is split, **every
+part is analysed in its own call**, and a combine step reasons over the partial
+findings plus the global overview — so a cause in part 2 and its effects in
 part 5 remain connectable. When even that will not work, you get a refusal with
-a reason and options — never a silent analysis of 3% of the log.
+a reason and options, never a silent analysis of 3% of the log.
+
+**A call may only cite what that call saw.** Evidence IDs are scoped per call,
+so the model cannot cite a real line it was never shown — which would otherwise
+sail through the grounding check because the line exists.
 
 **The model returns JSON, not prose.** It fills a typed schema; this app renders
 the Markdown. Section order and tables are identical every run, a missing field
@@ -123,7 +128,8 @@ All optional, all defaulting to sensible local-use values.
 | Auth | off (pointless on localhost) | `API_TOKENS` |
 | CORS | loopback origins only | `CORS_ORIGINS` |
 | Model allowlist | any | `ALLOWED_MODELS`, `ALLOW_MODEL_OVERRIDE` |
-| Test execution | on | `ENABLE_TEST_EXECUTION` |
+| Test execution | on; sandboxed via `bwrap` if installed | `ENABLE_TEST_EXECUTION` |
+| Redaction posture | redact and continue | `REDACTION_FAIL_CLOSED`, `REDACTION_PATTERNS` |
 
 Binding to a non-loopback interface without auth logs a security warning at
 startup naming the specific risk. Every response carries a request ID, in the
@@ -183,7 +189,7 @@ Errors carry a remediation, not just a status code:
 ## Tests
 
 ```bash
-.venv/bin/pytest                        # 197 tests, no network, no key, no cost
+.venv/bin/pytest                        # 213 tests, no network, no key, no cost
 node --test tests/markdown.test.mjs     # 22 renderer tests including XSS
 ```
 

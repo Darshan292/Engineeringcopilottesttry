@@ -279,6 +279,50 @@ def build_user_message(
     return "\n".join(blocks)
 
 
+def build_reduce_message(
+    tool: str,
+    skeleton: str,
+    partials: list[str],
+    *,
+    evidence_ids: list[str],
+) -> str:
+    """Assemble the combine turn from the per-part findings.
+
+    The reduce step sees the global overview plus every partial analysis, and
+    nothing else. It must not introduce evidence IDs the parts did not cite,
+    because it never saw the underlying content -- `evidence_ids` is therefore
+    the union of what the parts actually referenced, not the whole input.
+    """
+    blocks = [
+        skeleton,
+        "",
+        f"You are combining {len(partials)} partial analyses of one input that was too "
+        f"large to process in a single call. Each part saw the overview above and its "
+        f"own slice of the content.",
+        "",
+    ]
+    for index, partial in enumerate(partials, start=1):
+        blocks += [f"--- PARTIAL ANALYSIS {index} of {len(partials)} ---", partial, ""]
+
+    if evidence_ids:
+        shown = ", ".join(evidence_ids[:80])
+        more = f" ... ({len(evidence_ids)} in total)" if len(evidence_ids) > 80 else ""
+        blocks += [
+            f"EVIDENCE IDs CITED BY THE PARTS (you may cite only these): {shown}{more}",
+            "You did not see the raw content. Citing an ID no part referenced is a "
+            "fabrication and will be detected.",
+            "",
+        ]
+    else:
+        blocks += [
+            "The parts cited no evidence IDs. Say so plainly and keep confidence low.",
+            "",
+        ]
+
+    blocks.append("Return the combined JSON object now.")
+    return "\n".join(blocks)
+
+
 # The map-reduce combining prompt. Kept separate: the reduce step reasons over
 # partial findings plus the global overview, which is a different task from
 # analysing raw content.
@@ -300,6 +344,11 @@ Rules:
   in this chain saw everything at full detail. Say that in the rationale.
 - Return a single JSON object matching the same schema the parts used.
 """.strip()
+
+
+def build_reduce_system_prompt(tool: str) -> str:
+    """The combine step still has to satisfy the same output schema."""
+    return "\n\n".join([REDUCE_SYSTEM_PROMPT, _TOOL_INSTRUCTIONS[tool].strip(), _schema_block(tool)])
 
 
 # Backwards-compatible alias: the input-framing dictionary the earlier version
