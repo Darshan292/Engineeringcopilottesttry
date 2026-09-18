@@ -71,10 +71,13 @@
       <h2>Output</h2>
       <div class="out-actions">
         <span class="stats" id="stats"></span>
+        <button class="btn btn-quiet" id="diag-btn" type="button" disabled title="Per-stage audit trail">Diagnostics</button>
         <button class="btn btn-quiet" id="copy-btn" type="button" disabled>Copy</button>
         <button class="btn btn-quiet" id="download-btn" type="button" disabled>Download .md</button>
       </div>
     </div>
+
+    <div id="warnings" class="warnings" hidden></div>
 
     <div class="output-scroll">
       <div id="output" class="markdown-body">
@@ -86,6 +89,13 @@
       </div>
     </div>
   </section>
+  <aside id="diag-panel" class="diag-panel" hidden>
+    <div class="diag-head">
+      <h3>Diagnostics</h3>
+      <button class="icon-btn" id="diag-close" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="diag-body" class="diag-body"></div>
+  </aside>
 </main>
 
 <footer class="footer">

@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest==9.1.1
+# Optional: only needed for the browser UI check, not for the test suite.
+# playwright==1.49.0

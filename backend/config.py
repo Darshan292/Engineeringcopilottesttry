@@ -111,9 +111,16 @@ class Settings:
             )
         return None
 
+    @property
+    def test_execution_enabled(self) -> bool:
+        return (os.getenv("ENABLE_TEST_EXECUTION", "true") or "").strip().lower() not in {
+            "false", "0", "no", "off",
+        }
+
     def public_dict(self) -> dict:
         """Safe-to-serve view. Deliberately contains no key material."""
         return {
+            "test_execution_enabled": self.test_execution_enabled,
             "model": self.groq_model,
             "base_url": self.groq_base_url,
             "temperature": self.temperature,

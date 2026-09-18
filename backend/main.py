@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .config import settings
+from .governance import cors_origins, deployment_warnings
 from .routes.tools import router as tools_router
 
 logging.basicConfig(
@@ -38,14 +39,16 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# Local demo, no auth, no cookies. Wide-open CORS is fine here and makes it
-# painless to open the HTML file directly or serve it from another port.
+# Loopback by default rather than a wildcard: `*` is what lets a page on any
+# origin call this service the moment it is bound to a routable interface.
+# Widen deliberately with CORS_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins(),
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["*", "Authorization"],
+    expose_headers=["X-Request-ID", "Retry-After"],
 )
 
 app.include_router(tools_router)
@@ -82,6 +85,17 @@ async def announce() -> None:
         log.warning("  Fix: cp .env.example .env, then paste a key from https://console.groq.com/keys")
     if settings.model_warning:
         log.warning("  %s", settings.model_warning)
+
+    for warning in deployment_warnings(settings.host):
+        log.warning("  SECURITY: %s", warning)
+
+    log.info("  CORS origins: %s", ", ".join(cors_origins()))
+    log.info(
+        "  test execution: %s",
+        "enabled (generated code runs in a subprocess on this host)"
+        if settings.test_execution_enabled
+        else "disabled",
+    )
     log.info("  UI:   http://%s:%s/", settings.host, settings.port)
     log.info("  Docs: http://%s:%s/docs", settings.host, settings.port)
 

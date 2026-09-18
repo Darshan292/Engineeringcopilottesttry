@@ -1,5 +1,10 @@
+# All MIT / BSD / Apache-2.0. No paid services, no cloud dependencies.
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 httpx==0.28.1
 pydantic==2.10.4
 python-dotenv==1.0.1
+
+# Deterministic validation of model output.
+PyYAML==6.0.3                  # parse generated OpenAPI before validating it
+openapi-spec-validator==0.9.0  # Apache-2.0, bundles its schemas, works offline

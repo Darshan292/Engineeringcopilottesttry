@@ -23,7 +23,12 @@ const els = {
   charCount: $("char-count"),
   sampleNote: $("sample-note"),
   output: $("output"),
+  warnings: $("warnings"),
   stats: $("stats"),
+  diagBtn: $("diag-btn"),
+  diagPanel: $("diag-panel"),
+  diagBody: $("diag-body"),
+  diagClose: $("diag-close"),
   copyBtn: $("copy-btn"),
   downloadBtn: $("download-btn"),
   modelName: $("model-name"),
@@ -35,7 +40,9 @@ const els = {
   themeToggle: $("theme-toggle"),
 };
 
-const MAX_INPUT_CHARS = 60000;
+// Matches backend/schemas.py. This is a paste-sanity backstop, not a
+// capability limit -- large inputs are handled by compression and chunking.
+const MAX_INPUT_CHARS = 5000000;
 
 const state = {
   tools: [],
@@ -221,7 +228,10 @@ els.clearBtn.addEventListener("click", () => {
 
 function resetOutput() {
   state.lastMarkdown = "";
-  els.stats.textContent = "";
+  els.stats.innerHTML = "";
+  renderWarnings([]);
+  els.diagBtn.disabled = true;
+  els.diagPanel.hidden = true;
   els.copyBtn.disabled = true;
   els.downloadBtn.disabled = true;
   els.output.innerHTML =
@@ -239,42 +249,244 @@ function showThinking() {
   els.output.innerHTML =
     '<div class="thinking"><span class="spinner"></span>' +
     `<span>Asking the model to ${escapeHtml((tool && tool.title) || "run").toLowerCase()}...</span></div>` +
-    '<p class="thinking-hint">Typically 3-15 seconds. Longer inputs take longer.</p>';
-  els.stats.textContent = "";
+    '<p class="thinking-hint">Redacting, parsing and budgeting locally, then one model call. ' +
+    "Typically 3-15 seconds.</p>";
+  els.stats.innerHTML = "";
+  renderWarnings([]);
   els.copyBtn.disabled = true;
   els.downloadBtn.disabled = true;
 }
 
 function showError(message, hint) {
+  renderWarnings([]);
   els.output.innerHTML =
     '<div class="error-box"><h3>Request failed</h3>' +
     `<p>${escapeHtml(message)}</p>` +
     (hint ? `<p class="hint">${escapeHtml(hint)}</p>` : "") +
     "</div>";
-  els.stats.textContent = "";
+  els.stats.innerHTML = "";
+}
+
+/**
+ * Warnings are the part of the response a user must not miss: what was
+ * redacted before leaving the machine, what injection was neutralized, and
+ * whether the model saw the whole input or a compressed view.
+ */
+function classifyWarning(text) {
+  const lower = text.toLowerCase();
+  if (lower.includes("secret") || lower.includes("removed before")) return ["warn-secret", "redacted"];
+  if (lower.includes("injection")) return ["warn-injection", "injection"];
+  if (lower.includes("token") || lower.includes("compress") || lower.includes("chunk")) {
+    return ["warn-context", "context"];
+  }
+  return ["warn-general", "note"];
+}
+
+function renderWarnings(warnings) {
+  if (!warnings || !warnings.length) {
+    els.warnings.hidden = true;
+    els.warnings.innerHTML = "";
+    return;
+  }
+  els.warnings.hidden = false;
+  els.warnings.innerHTML = warnings
+    .map((text) => {
+      const [cls, tag] = classifyWarning(text);
+      return `<div class="warn-item ${cls}"><span class="warn-tag">${tag}</span><span>${escapeHtml(text)}</span></div>`;
+    })
+    .join("");
+}
+
+function row(label, value, cls) {
+  // Nested objects (level_counts, usage breakdowns) would render as
+  // "[object Object]" through String(); show their contents instead.
+  const text =
+    value && typeof value === "object"
+      ? Array.isArray(value)
+        ? value.join(", ") || "none"
+        : Object.entries(value)
+            .map(([k, v]) => `${k}=${v}`)
+            .join(", ") || "none"
+      : String(value);
+  return `<tr><td>${escapeHtml(label)}</td><td class="${cls || ""}">${escapeHtml(text)}</td></tr>`;
+}
+
+function section(title, rows) {
+  if (!rows) return "";
+  return `<div class="diag-section"><h4>${escapeHtml(title)}</h4><table class="diag-table">${rows}</table></div>`;
+}
+
+function renderDiagnostics(result) {
+  const d = result.diagnostics || {};
+  const parts = [];
+
+  parts.push(
+    section(
+      "Request",
+      row("request id", result.request_id) +
+        row("model", result.model) +
+        row("model calls", (result.trace && result.trace.upstream_calls) || result.attempts) +
+        row("attempts", result.attempts, result.attempts > 1 ? "diag-bad" : "diag-good") +
+        (result.repairs || []).map((r, i) => row(`repair ${i + 1}`, r, "diag-bad")).join("")
+    )
+  );
+
+  if (d.redaction) {
+    const r = d.redaction;
+    parts.push(
+      section(
+        "Redaction (before anything left this machine)",
+        row("items removed", r.redacted_count, r.redacted_count ? "diag-bad" : "diag-good") +
+          row("contained credentials", r.contained_credentials, r.contained_credentials ? "diag-bad" : "diag-good") +
+          Object.entries(r.by_kind || {}).map(([k, v]) => row(k, v)).join("")
+      )
+    );
+  }
+
+  if (d.injection) {
+    const i = d.injection;
+    parts.push(
+      section(
+        "Prompt-injection scan",
+        row("detected", i.detected, i.detected ? "diag-bad" : "diag-good") +
+          row("max severity", i.max_severity || "none") +
+          row("kinds", (i.kinds || []).join(", ") || "none") +
+          (i.excerpts || []).map((e, n) => row(`excerpt ${n + 1}`, e, "diag-bad")).join("")
+      )
+    );
+  }
+
+  if (d.input_kind) {
+    parts.push(
+      section(
+        "Input classification",
+        Object.entries(d.input_kind).map(([k, v]) => row(k, v)).join("")
+      )
+    );
+  }
+
+  if (d.parse) {
+    parts.push(
+      section("Deterministic extraction", Object.entries(d.parse).map(([k, v]) => row(k, v ?? "-")).join(""))
+    );
+  }
+
+  if (d.grounding) {
+    const g = d.grounding;
+    const fabricated = (g.citations_fabricated || []).length;
+    parts.push(
+      section(
+        "Evidence verification",
+        row("citations checked", g.citations_total) +
+          row("verified against input", g.citations_valid, "diag-good") +
+          row("fabricated", fabricated || "none", fabricated ? "diag-bad" : "diag-good") +
+          (fabricated ? row("fabricated ids", (g.citations_fabricated || []).join(", "), "diag-bad") : "") +
+          row("grounding ratio", g.grounding_ratio) +
+          row("claim coverage", g.claim_coverage)
+      )
+    );
+  }
+
+  if (d.confidence) {
+    const c = d.confidence;
+    parts.push(
+      section(
+        "Computed confidence",
+        row("computed", `${c.computed_band} (${Math.round(c.computed_score * 100)}%)`) +
+          row("model claimed", c.model_claimed_band || "n/a") +
+          row("overconfident", c.model_overconfident, c.model_overconfident ? "diag-bad" : "diag-good") +
+          (c.factors || []).map((f) => row(f.name, `${Math.round(f.value * 100)}% x ${f.weight}`)).join("") +
+          (c.warnings || []).map((w, n) => row(`caveat ${n + 1}`, w)).join("")
+      )
+    );
+  }
+
+  if (d.execution) {
+    const e = d.execution;
+    parts.push(
+      section(
+        "Generated tests, actually executed",
+        row("executed", e.executed, e.executed ? "diag-good" : "diag-bad") +
+          row("collected", e.collected) +
+          row("passed", e.passed, e.passed ? "diag-good" : "") +
+          row("failed", e.failed, e.failed ? "diag-bad" : "diag-good") +
+          row("errors", e.errors, e.errors ? "diag-bad" : "diag-good") +
+          row("duration", `${e.duration_seconds}s`) +
+          (e.collection_error ? row("collection error", e.collection_error, "diag-bad") : "")
+      )
+    );
+  }
+
+  if (d.coverage) {
+    parts.push(
+      section("Boundary coverage", Object.entries(d.coverage).map(([k, v]) => row(k, v)).join(""))
+    );
+  }
+
+  if (d.openapi) {
+    const o = d.openapi;
+    parts.push(
+      section(
+        "OpenAPI validation",
+        row("parses as YAML", o.parsed, o.parsed ? "diag-good" : "diag-bad") +
+          row("valid OpenAPI schema", o.schema_valid, o.schema_valid ? "diag-good" : "diag-bad") +
+          row("version", o.openapi_version || "-") +
+          row("operations documented", o.operations_documented) +
+          row("routes missing from spec", (o.routes_missing_from_spec || []).join(", ") || "none",
+              (o.routes_missing_from_spec || []).length ? "diag-bad" : "diag-good") +
+          row("spec routes not in code", (o.routes_in_spec_but_not_in_code || []).join(", ") || "none",
+              (o.routes_in_spec_but_not_in_code || []).length ? "diag-bad" : "diag-good") +
+          (o.errors || []).map((e, n) => row(`error ${n + 1}`, e, "diag-bad")).join("")
+      )
+    );
+  }
+
+  const stages = (result.trace && result.trace.stages) || [];
+  if (stages.length) {
+    const max = Math.max(...stages.map((s) => s.duration_ms), 1);
+    const bars = stages
+      .map(
+        (s) =>
+          `<div class="stage-bar"><span class="nm">${escapeHtml(s.name)}</span>` +
+          `<span class="bar" style="width:${Math.max(2, (s.duration_ms / max) * 200)}px"></span>` +
+          `<span class="ms">${s.duration_ms}ms</span></div>`
+      )
+      .join("");
+    parts.push(`<div class="diag-section"><h4>Pipeline stages</h4>${bars}</div>`);
+  }
+
+  els.diagBody.innerHTML = parts.join("");
 }
 
 function formatStats(result) {
   const parts = [`${(result.elapsed_ms / 1000).toFixed(1)}s`];
   const usage = result.usage || {};
   if (usage.total_tokens) parts.push(`${usage.total_tokens.toLocaleString()} tok`);
-  if (usage.prompt_tokens && usage.completion_tokens) {
-    parts.push(`${usage.prompt_tokens.toLocaleString()} in / ${usage.completion_tokens.toLocaleString()} out`);
-  }
+  if (result.attempts > 1) parts.push(`${result.attempts} attempts`);
   if (result.model) parts.push(result.model);
-  return parts.join(" · ");
+
+  // Computed confidence rides next to the cost, because it is the number a
+  // reader should weigh the document by.
+  const confidence = (result.diagnostics || {}).confidence;
+  const chip = confidence
+    ? `<span class="conf-chip conf-${escapeHtml(confidence.computed_band)}">confidence ` +
+      `${escapeHtml(confidence.computed_band)} ${Math.round(confidence.computed_score * 100)}%</span> `
+    : "";
+  return chip + escapeHtml(parts.join(" · "));
 }
 
 function paintResult(result) {
   state.lastMarkdown = result.markdown;
+  renderWarnings(result.warnings);
+  renderDiagnostics(result);
+  els.diagBtn.disabled = false;
 
-  const truncatedNote = result.truncated
-    ? '<div class="truncated-note"><strong>Output was cut off</strong> - the model hit its token cap. ' +
-      "Raise <code>GROQ_MAX_TOKENS</code> in <code>.env</code>, or run against a smaller input.</div>"
-    : "";
-
-  els.output.innerHTML = truncatedNote + renderMarkdown(result.markdown);
-  els.stats.textContent = formatStats(result);
+  // Truncation used to be surfaced here from a `truncated` flag. It no longer
+  // can be: the model returns JSON against a schema, so a cut-off response
+  // fails to parse and is handled by the repair loop instead, which is visible
+  // through `attempts` and `repairs` in the diagnostics drawer.
+  els.output.innerHTML = renderMarkdown(result.markdown);
+  els.stats.innerHTML = formatStats(result);
   els.copyBtn.disabled = false;
   els.downloadBtn.disabled = false;
   els.output.parentElement.scrollTop = 0;
@@ -403,6 +615,15 @@ async function run() {
 }
 
 els.runBtn.addEventListener("click", run);
+els.diagBtn.addEventListener("click", () => {
+  els.diagPanel.hidden = !els.diagPanel.hidden;
+});
+els.diagClose.addEventListener("click", () => {
+  els.diagPanel.hidden = true;
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") els.diagPanel.hidden = true;
+});
 
 // --- copy / download ------------------------------------------------------
 

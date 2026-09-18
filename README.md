@@ -1,96 +1,133 @@
 # Engineering Copilot
 
 Four internal engineering tools in one local web app. FastAPI backend, plain
-HTML + vanilla JS frontend, no build step. The only outbound call is to the
-Groq API on its free tier.
+HTML + vanilla JS frontend, no build step. Everything is free and open source;
+the only outbound call is to the Groq API on its free tier.
+
+The point of the design: **the LLM is one stage in a pipeline, not the pipeline.**
+Input is redacted, classified and parsed before it reaches the model, and
+everything the model returns is verified before it reaches you. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for why each stage exists.
 
 | Tool | Paste in | Get back |
 | --- | --- | --- |
-| **Unit Test Generator** | a function, class, or module | framework choice, an edge-case inventory, a runnable test file, and an honest list of what is hard to test |
-| **API Doc Generator** | route/handler code | an endpoint table, valid OpenAPI 3.1 YAML, a per-endpoint reference with `curl` examples |
-| **Log / RCA Summarizer** | a log excerpt | incident brief, evidence-linked timeline, root cause **with a confidence rating and contradicting evidence** |
-| **Postmortem Drafter** | an incident chat transcript | a blameless postmortem with role placeholders instead of names, and specific action items |
+| **Unit Test Generator** | a function, class or module | tests written against the boundary conditions extracted from the AST, **then actually executed** with the pass/fail result shown |
+| **API Doc Generator** | route/handler code | OpenAPI 3.1 that is **schema-validated and cross-checked** against the routes and error paths found in the source |
+| **Log / RCA Summarizer** | a log excerpt | incident brief where every claim cites a line ID that is **verified to exist**, with a confidence score computed in code |
+| **Postmortem Drafter** | an incident chat transcript | blameless postmortem where names were **removed before the model saw anything** |
 
-Every tool has a **Load sample** button with a realistic input, so you can see
-what it does without finding your own material first.
+Each tool has a **Load sample** button with a realistic input.
 
 ---
 
 ## Quick start
 
 ```bash
-git clone <this repo> && cd Engineeringcopilottesttry
-
 cp .env.example .env
 # paste a free key from https://console.groq.com/keys into .env
 
 ./run.sh
 ```
 
-Then open <http://127.0.0.1:8000>.
+Open <http://127.0.0.1:8000>.
 
-`run.sh` creates `.venv`, installs dependencies, and starts uvicorn with
-reload. If you would rather drive it yourself:
-
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn backend.main:app --reload
-```
-
-The API key is free and needs no credit card. Nothing else in this project
-costs anything: no database, no cloud services, no paid packages.
+No credit card, no database, no cloud services. Dependencies are FastAPI,
+uvicorn, httpx, pydantic, python-dotenv, PyYAML and openapi-spec-validator —
+all MIT/BSD/Apache-2.0.
 
 ---
 
-## Read this before you set `GROQ_MODEL`
+## Read this before setting `GROQ_MODEL`
 
-The default model for this kind of app used to be `llama-3.3-70b-versatile`.
-**It no longer works on Groq's free tier.** Groq deprecated it on 2026-06-17
-and decommissioned it on 2026-08-16; requests now come back
-`404 model_not_found`.
+The conventional default `llama-3.3-70b-versatile` **no longer works**. Groq
+deprecated it on 2026-06-17 and decommissioned it on 2026-08-16; requests now
+return `404 model_not_found`.
 
-This app therefore defaults to **`qwen/qwen3.6-27b`**, which is Groq's own
-recommended replacement, on the free tier, with a ~131K context window.
+The default here is **`qwen/qwen3.6-27b`**, Groq's own recommended replacement.
 
-| Model | Context | Notes |
-| --- | --- | --- |
-| `qwen/qwen3.6-27b` | ~131K | **Default.** Groq's recommended replacement. |
-| `openai/gpt-oss-120b` | ~131K | Larger, bigger output budget. Also free tier. |
-| `openai/gpt-oss-20b` | ~131K | Smaller and faster. |
+| Model | Notes |
+| --- | --- |
+| `qwen/qwen3.6-27b` | **Default.** ~131K context, free tier. |
+| `openai/gpt-oss-120b` | Larger. Follows JSON schemas more reliably — worth switching to if you see repair attempts. |
+| `openai/gpt-oss-20b` | Smaller and faster. |
 
-Model IDs churn, so the app never trusts a baked-in list:
-
-- `GET /api/models` proxies Groq's live model list for **your** key. This is
-  the only answer that is actually current — use it, not this README.
-- If you point `GROQ_MODEL` at a model the app knows is retired, it says so at
-  startup, shows a banner in the UI, and names the replacement in the error.
-
-Change the model without touching code:
-
-```bash
-GROQ_MODEL=openai/gpt-oss-120b ./run.sh
-```
-
----
-
-## Configuration
-
-All of it is environment variables; see `.env.example`.
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `GROQ_API_KEY` | *(required)* | Free key from console.groq.com |
-| `GROQ_MODEL` | `qwen/qwen3.6-27b` | Any model your key can call |
-| `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Point at any OpenAI-compatible endpoint |
-| `GROQ_TEMPERATURE` | `0.2` | Low on purpose — these are analysis tools, not creative ones |
-| `GROQ_MAX_TOKENS` | `4096` | Raise it if postmortems get cut off |
-| `GROQ_TIMEOUT_SECONDS` | `120` | Per-request timeout |
-| `HOST` / `PORT` | `127.0.0.1` / `8000` | Local binding |
+Model IDs churn, so the app never trusts a baked-in list. `GET /api/models`
+returns the live list for your key, and pointing `GROQ_MODEL` at a model known
+to be retired produces an error naming the replacement.
 
 Because `GROQ_BASE_URL` is configurable and the wire format is
-OpenAI-compatible, this also runs against Ollama, llama.cpp, or any other
-local OpenAI-shaped server with no code changes.
+OpenAI-compatible, this also runs against Ollama, llama.cpp, vLLM or LM Studio
+with no code changes. A loopback URL automatically bypasses any `HTTP_PROXY` in
+your environment.
+
+---
+
+## What makes this more than a prompt wrapper
+
+**Secrets never leave the machine.** AWS keys, JWTs, connection strings, GitHub
+and Slack tokens, private keys, emails and card numbers are detected and
+replaced with stable placeholders before the request is built, and a final gate
+refuses to send if anything survived. Private IPs are deliberately kept —
+`10.4.2.0/24` is the evidence in an RCA. The response tells you exactly what was
+withheld, by kind, never by value.
+
+**Structure is extracted, not inferred.** Python goes through `ast`, so the
+prompt receives the literal boundary conditions (`subtotal > 10000`,
+`customer_tier != 'platinum'`), the exceptions actually raised, and which calls
+cross a dependency boundary. Route code yields the `raise HTTPException(409)`
+paths buried in handler bodies — the errors hand-written docs always miss. Logs
+are field-split and clustered into templates. Transcripts are anonymized.
+
+**Large inputs are compressed, not truncated.** Repeated log messages collapse
+into templates with counts and first/last occurrence: a 60,000-line log
+compresses about 242x. When it still does not fit, the input is chunked with the
+global overview attached to every chunk, so a cause in part 2 and its effects in
+part 5 remain connectable. When even that will not work, you get a refusal with
+a reason and options — never a silent analysis of 3% of the log.
+
+**The model returns JSON, not prose.** It fills a typed schema; this app renders
+the Markdown. Section order and tables are identical every run, a missing field
+is a validation error with a path, and a bounded repair loop (2 retries) feeds
+the exact error back.
+
+**Claims are checked against the input.** Every cited evidence ID is verified
+against what the parser produced. An ID that does not exist is named as a
+fabrication and any timeline row resting on it is removed and reported.
+
+**Confidence is computed, not asked for.** Citation validity, claim coverage,
+evidence relevance, input parse rate, context completeness and whether
+disconfirming evidence was sought. The model's own rating is shown beside it,
+and a material gap is flagged as overconfidence.
+
+**Generated tests are executed.** In a subprocess against your actual source.
+"Verified: 3 of 3 tests pass" is a result. A failure feeds the repair loop with
+the real pytest output.
+
+**Generated OpenAPI is validated.** Parsed, checked against the OpenAPI 3.1
+schema, and cross-checked against the routes found in the source — so an
+omitted endpoint or an invented one is caught.
+
+**Blameless is structural.** Names are replaced before the prompt exists and the
+mapping is never serialized. The model cannot leak a name it was never shown.
+
+---
+
+## Governance
+
+All optional, all defaulting to sensible local-use values.
+
+| Control | Default | Variable |
+| --- | --- | --- |
+| Rate limit | 20/min, 500/day, shed locally | `RATE_LIMIT_PER_MINUTE`, `RATE_LIMIT_PER_DAY` |
+| Concurrency | 4 simultaneous upstream calls | `MAX_CONCURRENT_REQUESTS` |
+| Auth | off (pointless on localhost) | `API_TOKENS` |
+| CORS | loopback origins only | `CORS_ORIGINS` |
+| Model allowlist | any | `ALLOWED_MODELS`, `ALLOW_MODEL_OVERRIDE` |
+| Test execution | on | `ENABLE_TEST_EXECUTION` |
+
+Binding to a non-loopback interface without auth logs a security warning at
+startup naming the specific risk. Every response carries a request ID, in the
+body and the `X-Request-ID` header, and a per-stage timing trace.
 
 ---
 
@@ -98,138 +135,109 @@ local OpenAI-shaped server with no code changes.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/unit-tests` | `{"input": "...", "model"?, "temperature"?}` → markdown |
+| `POST` | `/api/unit-tests` | `{"input": "...", "model"?, "temperature"?}` |
 | `POST` | `/api/api-docs` | same shape |
 | `POST` | `/api/log-rca` | same shape |
 | `POST` | `/api/postmortem` | same shape |
 | `GET` | `/api/tools` | tab metadata + samples (the UI builds itself from this) |
-| `GET` | `/api/samples/{tool}` | one sample input |
-| `GET` | `/api/config` | non-secret runtime config |
+| `GET` | `/api/config` | non-secret config, governance state, your rate-limit usage |
 | `GET` | `/api/models` | live model list from Groq |
 | `GET` | `/api/health` | liveness + whether the key is configured |
-| `GET` | `/docs` | interactive OpenAPI docs (FastAPI built-in) |
+| `GET` | `/docs` | interactive OpenAPI docs |
 
-Success:
+A successful response carries the rendered document plus everything needed to
+audit it:
 
 ```json
 {
   "tool": "log-rca",
-  "markdown": "## Summary\n...",
-  "model": "qwen/qwen3.6-27b",
-  "finish_reason": "stop",
-  "elapsed_ms": 4120,
-  "usage": {"prompt_tokens": 1180, "completion_tokens": 940, "total_tokens": 2120},
-  "truncated": false
+  "request_id": "4e295766e9f1",
+  "markdown": "# Incident Brief\n...",
+  "warnings": ["2 secret(s) were removed before the request left this machine: ..."],
+  "attempts": 1,
+  "repairs": [],
+  "diagnostics": {
+    "redaction":  {"redacted_count": 2, "by_kind": {"AWS_ACCESS_KEY": 1}, "contained_credentials": true},
+    "injection":  {"detected": true, "max_severity": "high", "kinds": ["instruction_override"]},
+    "parse":      {"total_lines": 26, "parse_rate": 0.96, "distinct_templates": 16, "first_anomaly_id": "L3"},
+    "grounding":  {"citations_total": 9, "citations_valid": 8, "citations_fabricated": ["L9999"]},
+    "confidence": {"computed_score": 0.35, "computed_band": "low", "model_claimed_band": "high",
+                   "model_overconfident": true, "factors": [...]}
+  },
+  "trace": {"stages": [{"name": "redact", "duration_ms": 1}, ...]}
 }
 ```
 
-Failure — every error carries a remediation, not just a status code:
+Errors carry a remediation, not just a status code:
 
 ```json
 {
   "error": "Model 'llama-3.3-70b-versatile' is unavailable: model_not_found",
-  "hint": "'llama-3.3-70b-versatile' is retired: Decommissioned on the Groq free/developer tier on 2026-08-16. Set GROQ_MODEL=qwen/qwen3.6-27b in .env and restart."
+  "hint": "'llama-3.3-70b-versatile' is retired: Decommissioned on the Groq free/developer tier on 2026-08-16. Set GROQ_MODEL=qwen/qwen3.6-27b in .env and restart.",
+  "request_id": "4e295766e9f1"
 }
 ```
-
----
-
-## How it works
-
-```
-frontend/index.html  ──fetch()──►  POST /api/<tool>
-                                      │
-                          backend/prompts.py  (the actual product)
-                                      │
-                          backend/groq_client.py  ──HTTPS──►  Groq
-                                      │
-                          markdown ◄──┘
-                                      │
-              frontend/markdown.js → sanitized HTML → the page
-```
-
-```
-backend/
-  main.py          FastAPI app, static mount, validation-error formatting
-  config.py        env config, model defaults, retired-model warnings
-  groq_client.py   HTTP client + error translation
-  prompts.py       the four system prompts
-  samples.py       one realistic sample input per tool
-  schemas.py       request/response models, input size cap
-  routes/tools.py  the endpoints
-frontend/
-  index.html       single page, no framework
-  app.js           tabs, run, copy/download, lazy Mermaid
-  markdown.js      hand-rolled, escape-first markdown renderer
-  styles.css       dark/light theme
-tests/
-  test_api.py         routing, validation, error translation (stubbed Groq)
-  test_e2e_local.py   full HTTP path against a local OpenAI-compatible mock
-  markdown.test.mjs   renderer, including the XSS cases
-```
-
-### Design decisions worth knowing
-
-**The prompts are the product.** Everything else is plumbing. Each prompt pins
-an exact output contract, names the failure mode it is guarding against, and
-forces explicit uncertainty — the RCA tool has to state a confidence level and
-list contradicting evidence, and "insufficient evidence" is an allowed answer.
-The postmortem tool is forbidden from carrying human names out of a transcript.
-
-**Pasted content is data, not instructions.** Input is fenced with explicit
-delimiters and every system prompt states that anything inside is content to
-analyse, never a directive. A log excerpt containing "ignore previous
-instructions" gets analysed, not obeyed.
-
-**The markdown renderer escapes first.** The whole document is HTML-escaped
-before any markup is generated, so there is no raw-HTML passthrough for model
-output to exploit. Links go through a protocol allowlist. This is covered by
-tests that assert `<script>`, `onerror=`, and `javascript:` URLs stay inert.
-
-**Errors tell you what to do.** A 404 from Groq becomes "this model is retired,
-set `GROQ_MODEL=<replacement>`". A 429 explains the free-tier limits and
-suggests another model to get a separate rate-limit bucket. A missing key gives
-you the two commands that fix it.
-
-**Mermaid loads lazily.** It is imported from the CDN only when a diagram
-actually appears, and falls back to showing the diagram source if the CDN is
-unreachable — so the app works fully offline apart from the Groq call itself.
-
-**No persistence, on purpose.** No database, no accounts, no session state. The
-only thing kept is in-browser: your draft and last result per tab, so switching
-tabs does not lose work. Refreshing clears everything.
 
 ---
 
 ## Tests
 
 ```bash
-.venv/bin/pytest              # 39 backend tests
-node --test tests/markdown.test.mjs   # 22 renderer tests
+.venv/bin/pytest                        # 197 tests, no network, no key, no cost
+node --test tests/markdown.test.mjs     # 22 renderer tests including XSS
 ```
 
-No network, no API key, and no cost: `test_api.py` stubs the Groq call,
-`test_e2e_local.py` stands up a local server that speaks Groq's wire protocol
-and drives the whole stack over real HTTP.
+The suites cover the deterministic layer, every parser, the validation layer
+(including really executing generated tests), the API and governance, and an
+adversarial set: prompt injection, leaked secrets, fabricated citations,
+malformed code, 50k-line logs, contradictory evidence and repair-loop bounds.
 
-If your shell has an HTTP proxy configured, exclude loopback so the
-local-mock tests can connect:
+**These prove the system behaves correctly. They say nothing about whether the
+model's analysis is any good.** That needs a real model:
 
 ```bash
-NO_PROXY=127.0.0.1,localhost .venv/bin/pytest
+export GROQ_API_KEY=...
+python -m evals.run                  # 5 golden cases, 31 checks, 9 critical
+python -m evals.run --repeat 3       # exposes non-determinism
+python -m evals.run --model openai/gpt-oss-120b --verbose
+```
+
+Checks are deterministic predicates over the document and diagnostics — no
+LLM-as-judge, because grading a model's output with another model inherits the
+same failure modes. Critical checks (no leaked names, no fabricated citations,
+tests that execute, valid OpenAPI) fail the run regardless of the aggregate
+score. `--repeat` matters: a single green run hides the cases that pass only
+most of the time.
+
+---
+
+## Project layout
+
+```
+backend/
+  core/         redaction, detection, tokens, injection, chunking, IR
+  parsers/      logs (+ template mining), code (AST), routes, transcripts
+  validation/   schemas, grounding, confidence, openapi, python_exec
+  pipeline/     structured calls with repair, tracing, the four tool pipelines
+  render/       validated structures -> Markdown
+  governance.py rate limits, model policy, auth, CORS
+frontend/       single page, vanilla JS, hand-rolled escape-first Markdown
+tests/          209 tests, all free to run
+evals/          golden set, run against a real model
 ```
 
 ---
 
-## What is not built yet
+## Not built yet
 
-The stack was specified with two things these four tools do not need, so they
-are deliberately not wired up:
+- **Zip upload handling.** No tool takes a repo archive; all four take pasted
+  text. Nothing imports `zipfile`.
+- **Mermaid diagrams.** Rendering support exists in the frontend but no tool is
+  required to emit one.
+- **tree-sitter parsing** for non-Python languages. They currently get
+  regex-based signature extraction at ~0.45 confidence, and the prompt is told
+  to qualify its claims accordingly. This is the clearest next improvement.
 
-- **Zip upload handling** (`zipfile`). No current tool takes a repo archive;
-  all four take pasted text. Nothing here imports `zipfile`.
-- **Mermaid diagrams** are rendered when a model emits a ` ```mermaid ` block
-  (the RCA prompt's timelines are the natural fit), but no tool is *required*
-  to produce one yet.
-
-Both are in place to build on rather than pretended to be finished.
+Stated rather than pretended to be finished. See the **Honest limits** section
+of [ARCHITECTURE.md](ARCHITECTURE.md) for what the verification layer does and
+does not prove.

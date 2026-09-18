@@ -493,3 +493,111 @@ body {
   .pane-output { min-height: 50vh; }
   .brand-sub, .footer span:first-child { display: none; }
 }
+
+
+/* ---------- warnings strip ---------- */
+
+.warnings {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--border-soft);
+  padding: 10px 20px;
+  background: rgba(210, 153, 34, 0.07);
+  max-height: 32vh;
+  overflow-y: auto;
+}
+.warnings[hidden] { display: none; }
+.warn-item {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 3px 0;
+  line-height: 1.5;
+}
+.warn-item .warn-tag {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid currentColor;
+  height: fit-content;
+  margin-top: 1px;
+}
+.warn-secret { color: var(--bad); }
+.warn-injection { color: var(--bad); }
+.warn-context { color: var(--accent); }
+.warn-general { color: var(--warn); }
+
+/* ---------- confidence chip ---------- */
+
+.conf-chip {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.conf-high { color: var(--good); }
+.conf-medium { color: var(--warn); }
+.conf-low { color: var(--bad); }
+
+/* ---------- diagnostics drawer ---------- */
+
+.diag-panel {
+  position: fixed;
+  top: 0; right: 0; bottom: 0;
+  width: min(560px, 92vw);
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  z-index: 40;
+}
+.diag-panel[hidden] { display: none; }
+.diag-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.diag-head h3 { margin: 0; font-size: 13px; }
+.diag-body { flex: 1 1 auto; overflow-y: auto; padding: 14px 16px 30px; }
+
+.diag-section { margin-bottom: 18px; }
+.diag-section h4 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+.diag-table { width: 100%; border-collapse: collapse; font-size: 11.5px; font-family: var(--mono); }
+.diag-table td { padding: 3px 6px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+.diag-table td:first-child { color: var(--text-faint); width: 45%; white-space: nowrap; }
+.diag-table td:last-child { color: var(--text); word-break: break-word; }
+.diag-bad { color: var(--bad) !important; }
+.diag-good { color: var(--good) !important; }
+
+.stage-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 0;
+}
+.stage-bar .bar {
+  height: 4px;
+  background: var(--accent);
+  border-radius: 2px;
+  min-width: 2px;
+}
+.stage-bar .nm { flex: 0 0 150px; color: var(--text-dim); }
+.stage-bar .ms { color: var(--text-faint); }

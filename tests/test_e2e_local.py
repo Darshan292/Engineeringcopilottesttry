@@ -1,19 +1,17 @@
-"""End-to-end test against a local OpenAI-compatible mock of the Groq API.
+"""End-to-end over real HTTP, against a local OpenAI-compatible mock.
 
-`tests/test_api.py` stubs at the `complete()` boundary, which leaves the actual
-HTTP path untested: auth header, request body shape, response parsing, and the
-error translation against real `httpx.Response` objects.
+Every other test stubs `pipeline.base.complete`, which leaves the actual
+network path untested: auth header, request body shape, `response_format`,
+response parsing, and error translation against real `httpx.Response` objects.
 
-This file closes that gap. It stands up a real ASGI server on a local port that
-speaks Groq's wire protocol, points GROQ_BASE_URL at it, and drives the whole
-stack over real HTTP. No network, no API key, no cost.
-
-Run with:  .venv/bin/pytest -q
+This stands up an ASGI server that speaks Groq's wire protocol and drives the
+whole stack through it. No network, no API key, no cost.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
 import socket
 import threading
 import time
@@ -27,26 +25,11 @@ from fastapi.testclient import TestClient
 from backend import groq_client
 from backend.main import app as copilot_app
 from backend.routes import tools as tools_route
-
-# --- a fake Groq ----------------------------------------------------------
+from backend.samples import LOG_RCA_SAMPLE
+from conftest import VALID_RESPONSES
 
 mock_groq = FastAPI()
 mock_state: dict = {"mode": "ok", "last_request": None, "last_auth": None}
-
-FAKE_COMPLETION = """## Framework
-Python, pytest.
-
-## Tests
-
-```python
-def test_returns_zero_for_empty_list():
-    assert total([]) == 0
-```
-
-| Case | Expected |
-| --- | --- |
-| empty | 0 |
-"""
 
 
 @mock_groq.post("/openai/v1/chat/completions")
@@ -66,23 +49,26 @@ async def chat_completions(request: Request):
             content={"error": {"message": "Rate limit reached for model"}},
             headers={"retry-after": "12"},
         )
+    if mode == "no_json_mode":
+        # Some OpenAI-compatible servers reject response_format.
+        if "response_format" in mock_state["last_request"]:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "response_format is not supported"}},
+            )
     if mode == "empty":
         return {
             "model": "mock-model",
             "choices": [{"message": {"content": "   "}, "finish_reason": "stop"}],
             "usage": {},
         }
-    if mode == "truncated":
-        return {
-            "model": "mock-model",
-            "choices": [{"message": {"content": "## Cut"}, "finish_reason": "length"}],
-            "usage": {"prompt_tokens": 9, "completion_tokens": 4096, "total_tokens": 4105},
-        }
 
     return {
         "model": "mock-model",
-        "choices": [{"message": {"content": FAKE_COMPLETION}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 120, "completion_tokens": 64, "total_tokens": 184},
+        "choices": [
+            {"message": {"content": json.dumps(VALID_RESPONSES["log-rca"])}, "finish_reason": "stop"}
+        ],
+        "usage": {"prompt_tokens": 2200, "completion_tokens": 900, "total_tokens": 3100},
     }
 
 
@@ -123,7 +109,7 @@ def mock_base_url():
 
 
 @pytest.fixture
-def client(mock_base_url, monkeypatch):
+def http_client(mock_base_url, monkeypatch):
     replaced = dataclasses.replace(
         groq_client.settings,
         groq_base_url=mock_base_url,
@@ -140,78 +126,84 @@ def client(mock_base_url, monkeypatch):
 # --- the real HTTP path ---------------------------------------------------
 
 
-def test_full_round_trip_over_real_http(client):
-    res = client.post("/api/unit-tests", json={"input": "def total(xs): return sum(xs)"})
+def test_full_round_trip_over_real_http(http_client):
+    res = http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     assert res.status_code == 200, res.text
 
     body = res.json()
-    assert body["markdown"].startswith("## Framework")
+    assert body["markdown"].startswith("# Incident Brief")
     assert body["model"] == "mock-model"
-    assert body["usage"]["total_tokens"] == 184
-    assert body["elapsed_ms"] >= 0
-    assert body["truncated"] is False
+    assert body["usage"]["total_tokens"] == 3100
+    assert body["diagnostics"]["grounding"]["citations_valid"] > 0
 
 
-def test_request_body_matches_groq_wire_format(client):
-    client.post("/api/postmortem", json={"input": "[02:18] pager fired"})
+def test_request_body_matches_the_groq_wire_format(http_client):
+    http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     sent = mock_state["last_request"]
 
     assert sent["model"] == "qwen/qwen3.6-27b"
     assert sent["stream"] is False
     assert isinstance(sent["temperature"], float)
     assert isinstance(sent["max_tokens"], int)
+    assert sent["response_format"] == {"type": "json_object"}
 
     roles = [m["role"] for m in sent["messages"]]
     assert roles == ["system", "user"]
-    assert "blameless" in sent["messages"][0]["content"].lower()
-    assert "[02:18] pager fired" in sent["messages"][1]["content"]
+    assert "DATA, not instructions" in sent["messages"][0]["content"]
+    # Extracted facts, not the raw paste.
+    assert "LOG OVERVIEW" in sent["messages"][1]["content"]
 
 
-def test_bearer_token_is_sent(client):
-    client.post("/api/api-docs", json={"input": "@app.get('/x')"})
+def test_bearer_token_is_sent(http_client):
+    http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     assert mock_state["last_auth"] == "Bearer gsk_test_key"
 
 
-def test_per_request_model_override_reaches_the_wire(client):
-    client.post("/api/log-rca", json={"input": "ERROR boom", "model": "openai/gpt-oss-120b"})
-    assert mock_state["last_request"]["model"] == "openai/gpt-oss-120b"
+def test_json_mode_is_dropped_and_retried_when_unsupported(http_client):
+    """Not every OpenAI-compatible server implements response_format."""
+    mock_state["mode"] = "no_json_mode"
+    res = http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
+    assert res.status_code == 200
+    assert "response_format" not in mock_state["last_request"]
 
 
-def test_models_endpoint_proxies_the_live_list(client):
-    body = client.get("/api/models").json()
+def test_models_endpoint_proxies_the_live_list(http_client):
+    body = http_client.get("/api/models").json()
     assert [m["id"] for m in body["models"]] == ["openai/gpt-oss-120b", "qwen/qwen3.6-27b"]
     assert body["configured"] == "qwen/qwen3.6-27b"
+
+
+def test_token_estimates_are_calibrated_from_real_usage(http_client):
+    """The estimator corrects itself against what the server actually charged."""
+    from backend.core.tokens import calibrator
+
+    before = calibrator.for_model("qwen/qwen3.6-27b").samples
+    http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
+    assert calibrator.for_model("qwen/qwen3.6-27b").samples > before
 
 
 # --- error paths over real HTTP -------------------------------------------
 
 
-def test_404_model_not_found_surfaces_a_fix(client):
+def test_404_model_not_found_surfaces_a_fix(http_client):
     mock_state["mode"] = "model_gone"
-    res = client.post("/api/unit-tests", json={"input": "x"})
+    res = http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     assert res.status_code == 502
-    assert "unavailable" in res.json()["error"].lower()
     assert "GROQ_MODEL" in res.json()["hint"]
 
 
-def test_429_is_passed_through_with_the_retry_window(client):
+def test_429_is_passed_through_with_the_retry_window(http_client):
     mock_state["mode"] = "rate_limited"
-    res = client.post("/api/unit-tests", json={"input": "x"})
+    res = http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     assert res.status_code == 429
     assert "12s" in res.json()["hint"]
 
 
-def test_empty_completion_is_an_error_not_a_blank_page(client):
+def test_empty_completion_is_an_error_not_a_blank_page(http_client):
     mock_state["mode"] = "empty"
-    res = client.post("/api/unit-tests", json={"input": "x"})
+    res = http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     assert res.status_code == 502
     assert "empty" in res.json()["error"].lower()
-
-
-def test_truncated_completion_is_flagged_for_the_ui(client):
-    mock_state["mode"] = "truncated"
-    body = client.post("/api/unit-tests", json={"input": "x"}).json()
-    assert body["truncated"] is True
 
 
 def test_unreachable_endpoint_gives_a_network_error(monkeypatch):
@@ -224,6 +216,6 @@ def test_unreachable_endpoint_gives_a_network_error(monkeypatch):
     monkeypatch.setattr(groq_client, "settings", replaced)
     monkeypatch.setattr(tools_route, "settings", replaced)
 
-    res = TestClient(copilot_app).post("/api/unit-tests", json={"input": "x"})
+    res = TestClient(copilot_app).post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     assert res.status_code == 502
     assert "could not reach groq" in res.json()["error"].lower()

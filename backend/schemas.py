@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
 
-# Guardrail against someone pasting a 10MB file into a textarea and burning
-# their whole daily rate-limit budget on one doomed request.
-MAX_INPUT_CHARS = 60_000
+# A backstop against a genuinely absurd paste, not a capability limit. Input
+# size is governed downstream by the token budget and the chunk planner, which
+# compress what they can and refuse the rest with a specific reason and remedy.
+# The old 60k cap predated that layer and rejected logs the system now handles.
+MAX_INPUT_CHARS = 5_000_000
 
 
 class ToolRequest(BaseModel):
@@ -26,7 +28,9 @@ class ToolRequest(BaseModel):
         if len(stripped) > MAX_INPUT_CHARS:
             raise ValueError(
                 f"Input is {len(stripped):,} characters, over the {MAX_INPUT_CHARS:,} "
-                f"limit. Paste a smaller excerpt."
+                f"character limit. Large inputs below that limit are handled by "
+                f"compression and chunking, so narrow the excerpt to the window you "
+                f"care about rather than splitting it arbitrarily."
             )
         return stripped
 
@@ -47,17 +51,25 @@ class Usage(BaseModel):
 
 class ToolResponse(BaseModel):
     tool: str
+    request_id: str = ""
     markdown: str
     model: str
-    finish_reason: str | None = None
     elapsed_ms: int
-    usage: Usage
-    truncated: bool = Field(
-        default=False,
-        description="True when the model hit its output cap and the answer is cut short.",
-    )
+    usage: dict = Field(default_factory=dict)
+    # Surfaced prominently in the UI: redactions performed, injection attempts
+    # neutralized, input-kind mismatches, context compression.
+    warnings: list[str] = Field(default_factory=list)
+    # Per-stage machine-readable results: parse stats, grounding ratios,
+    # computed confidence factors, test-execution outcome, OpenAPI validation.
+    diagnostics: dict = Field(default_factory=dict)
+    # How many model calls it took to get a valid response, and why the
+    # rejected ones were rejected.
+    attempts: int = 1
+    repairs: list[str] = Field(default_factory=list)
+    trace: dict = Field(default_factory=dict)
 
 
 class ErrorResponse(BaseModel):
     error: str
     hint: str | None = None
+    request_id: str = ""

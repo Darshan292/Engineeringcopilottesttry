@@ -30,6 +30,30 @@ class GroqError(Exception):
         self.hint = hint
 
 
+def _is_loopback(url: str) -> bool:
+    from urllib.parse import urlparse
+
+    host = (urlparse(url).hostname or "").lower()
+    return host in {"127.0.0.1", "localhost", "::1", "0.0.0.0"} or host.endswith(".localhost")
+
+
+def _client() -> httpx.AsyncClient:
+    """Build the HTTP client for the configured endpoint.
+
+    A loopback base URL means a local OpenAI-compatible server (Ollama,
+    llama.cpp, vLLM, a test double). Those must not be routed through an
+    ambient HTTP_PROXY: on a machine with a corporate proxy configured, httpx
+    would send the request to the proxy, which refuses to tunnel to localhost,
+    and the app fails with a confusing 403 for a server running on the same
+    machine. `trust_env=False` bypasses proxy resolution for that case only;
+    real Groq traffic still honours the environment's proxy settings.
+    """
+    return httpx.AsyncClient(
+        timeout=settings.timeout_seconds,
+        trust_env=not _is_loopback(settings.groq_base_url),
+    )
+
+
 def _auth_headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {settings.groq_api_key}",
@@ -125,12 +149,20 @@ async def complete(
     model: str | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    json_mode: bool = False,
 ) -> dict[str, Any]:
-    """Run one chat completion. Returns the text plus usage/latency metadata."""
+    """Run one chat completion. Returns the text plus usage/latency metadata.
+
+    `json_mode` sets the OpenAI-compatible `response_format` so the server
+    constrains decoding to valid JSON. It removes the whole class of "the model
+    wrote a sentence before the object" failures at the source rather than
+    leaving them to the repair loop. Servers that do not support it reject the
+    request with a 400, which is retried once without the flag.
+    """
     _require_key()
 
     chosen_model = (model or settings.groq_model).strip()
-    body = {
+    body: dict[str, Any] = {
         "model": chosen_model,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -140,10 +172,12 @@ async def complete(
         "max_tokens": settings.max_tokens if max_tokens is None else max_tokens,
         "stream": False,
     }
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
 
     started = time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=settings.timeout_seconds) as client:
+        async with _client() as client:
             response = await client.post(
                 f"{settings.groq_base_url}/chat/completions",
                 headers=_auth_headers(),
@@ -163,6 +197,20 @@ async def complete(
         ) from exc
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+    # Not every OpenAI-compatible server implements response_format. Drop it
+    # and retry once rather than failing a request over an optional flag.
+    if response.status_code == 400 and json_mode and "response_format" in (response.text or ""):
+        body.pop("response_format", None)
+        try:
+            async with _client() as client:
+                response = await client.post(
+                    f"{settings.groq_base_url}/chat/completions",
+                    headers=_auth_headers(),
+                    json=body,
+                )
+        except httpx.HTTPError as exc:
+            raise GroqError(f"Could not reach Groq: {exc}", status=502) from exc
 
     if response.status_code >= 400:
         raise _translate_http_error(response, chosen_model)
@@ -189,6 +237,24 @@ async def complete(
         )
 
     usage = payload.get("usage") or {}
+
+    # Close the calibration loop: compare what we estimated for this exact
+    # payload against what the server actually charged, so future budgets for
+    # this model converge on the truth.
+    actual_prompt_tokens = usage.get("prompt_tokens")
+    if actual_prompt_tokens:
+        try:
+            from .core.tokens import calibrator, estimate_messages_tokens
+
+            calibrator.observe(
+                chosen_model,
+                estimate_messages_tokens(body["messages"]),
+                int(actual_prompt_tokens),
+            )
+        except Exception:
+            # Calibration is an optimisation; never fail a good response over it.
+            pass
+
     return {
         "text": text.strip(),
         "model": payload.get("model", chosen_model),
@@ -210,7 +276,7 @@ async def list_models() -> list[dict[str, Any]]:
     """
     _require_key()
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with _client() as client:
             response = await client.get(
                 f"{settings.groq_base_url}/models", headers=_auth_headers()
             )
