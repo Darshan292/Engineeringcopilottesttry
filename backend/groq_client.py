@@ -198,6 +198,16 @@ async def complete(
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
 
+    # The provider states its real limits for this model and account on every
+    # response, including error responses. Adopt them so the local budget is
+    # not a guess compiled into the source.
+    try:
+        from .governance import adopt_provider_limits
+
+        adopt_provider_limits(response.headers)
+    except Exception:
+        pass
+
     # Not every OpenAI-compatible server implements response_format. Drop it
     # and retry once rather than failing a request over an optional flag.
     if response.status_code == 400 and json_mode and "response_format" in (response.text or ""):
@@ -291,16 +301,30 @@ async def list_models() -> list[dict[str, Any]]:
     except ValueError as exc:
         raise GroqError("Groq's model list was not valid JSON.", status=502) from exc
 
-    models = [
-        {
-            "id": m.get("id"),
-            "owned_by": m.get("owned_by"),
-            "context_window": m.get("context_window"),
-            "active": m.get("active", True),
-        }
-        for m in data
-        if m.get("id")
-    ]
+    from .core.tokens import MIN_USABLE_CONTEXT, non_chat_reason
+
+    models = []
+    for m in data:
+        model_id = m.get("id")
+        if not model_id:
+            continue
+        window = m.get("context_window")
+        reason = non_chat_reason(str(model_id))
+        if reason is None and isinstance(window, int) and 0 < window < MIN_USABLE_CONTEXT:
+            reason = f"context window of {window:,} tokens is too small for this application"
+        models.append(
+            {
+                "id": model_id,
+                "owned_by": m.get("owned_by"),
+                "context_window": window,
+                "active": m.get("active", True),
+                # The provider lists every model the key can call, including
+                # classifiers and speech models. Selecting one of those fails
+                # deep in the pipeline, so mark them here where they are listed.
+                "usable": reason is None,
+                "unusable_reason": reason,
+            }
+        )
     models.sort(key=lambda m: str(m["id"]))
 
     # Treat what the provider reports as authoritative over the static table.

@@ -279,14 +279,86 @@ def test_input_that_cannot_fit_is_refused_with_a_remedy(client, for_tool, monkey
     monkeypatch.setattr(chunking, "DEFAULT_MAX_CHUNKS", 2)
     for_tool("log-rca")
 
-    # Force a tiny context window so even compression cannot fit.
+    # A window that is usable in principle but far too small for this input.
+    # Below MIN_USABLE_CONTEXT it would be refused as an unusable model instead,
+    # which is a different (also correct) path covered elsewhere.
     from backend.core import tokens
 
-    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 4096)
+    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 8_000)
+    monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
 
     res = client.post("/api/log-rca", json={"input": _repetitive_log(20_000)})
-    assert res.status_code == 413
-    assert "context window" in res.json()["error"] or "chunks" in res.json()["error"]
+    assert res.status_code == 413, res.text
+    body = res.json()
+    assert "context window" in body["error"] or "chunks" in body["error"]
+    assert body["hint"]
+
+
+def test_a_non_chat_model_is_refused_by_name(client, for_tool, patch_settings):
+    """The provider lists classifiers and speech models; selecting one must
+    fail immediately with something actionable, not deep in the planner."""
+    patch_settings(groq_model="meta-llama/llama-prompt-guard-2-86m")
+    for_tool("log-rca")
+
+    res = client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
+    assert res.status_code == 422
+    body = res.json()
+    assert "classifier" in body["error"]
+    assert "chat model" in body["error"]
+    assert "GROQ_MODEL" in body["hint"]
+
+
+def test_a_too_small_context_window_is_refused_by_name(client, for_tool, patch_settings, monkeypatch):
+    from backend.core import tokens
+
+    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "tiny-chat-model", 512)
+    monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
+    patch_settings(groq_model="tiny-chat-model")
+    for_tool("log-rca")
+
+    res = client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
+    assert res.status_code == 422
+    body = res.json()
+    assert "512-token context window" in body["error"]
+    assert "too small" in body["error"]
+    # The remedy must name models that actually work.
+    assert "gpt-oss" in body["hint"] or "qwen" in body["hint"]
+
+
+def test_the_token_budget_sheds_before_spending_upstream_quota(client, for_tool, monkeypatch):
+    """Groq's free tier binds on tokens per minute, not requests per minute."""
+    from backend import governance
+
+    monkeypatch.setattr(governance.token_limiter, "per_minute", 5_000)
+    stub = for_tool("log-rca")
+
+    first = client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
+    assert first.status_code == 200
+    calls_after_first = stub.call_count
+
+    second = client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
+    assert second.status_code == 429
+    body = second.json()
+    assert "tokens/minute" in body["error"]
+    assert "no quota was spent upstream" in body["hint"]
+    assert "Retry-After" in second.headers
+    # The refused request never reached the provider.
+    assert stub.call_count == calls_after_first
+
+
+def test_repair_attempts_respect_the_token_budget(client, for_tool, monkeypatch):
+    """A repair costs as much as the original call and must not blow the budget."""
+    from backend import governance
+
+    # Enough for one call, not two.
+    monkeypatch.setattr(governance.token_limiter, "per_minute", 4_500)
+    stub = for_tool("log-rca")
+    stub.script("not json at all")
+
+    res = client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
+    assert res.status_code == 429
+    # One attempt made, the repair shed locally rather than 429'd upstream.
+    assert stub.call_count == 1
 
 
 def test_a_single_enormous_line_does_not_hang(client, for_tool):

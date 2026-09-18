@@ -31,6 +31,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from ..core.tokens import estimate_messages_tokens
 from ..groq_client import GroqError, complete
 
 T = TypeVar("T", bound=BaseModel)
@@ -203,6 +204,7 @@ async def call_structured(
     max_tokens: int | None = None,
     stage_name: str = "llm_structured",
     extra_validators: list | None = None,
+    client_key: str = "local",
 ) -> StructuredResult:
     """Call the model, validate against `schema`, repair on failure.
 
@@ -220,7 +222,22 @@ async def call_structured(
     last_raw = ""
     used_model = model or ""
 
+    from ..governance import enforce_token_budget, token_limiter
+
     for attempt in range(1, MAX_REPAIR_ATTEMPTS + 2):
+        # Check the token budget before each attempt, including repairs. A
+        # repair costs as much as the original call, so a loop that ignores the
+        # budget turns one oversized request into an upstream 429 naming a
+        # limit the caller has never seen.
+        projected = estimate_messages_tokens(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": messages_user}]
+        ) + (max_tokens or 0)
+        enforce_token_budget(
+            client_key,
+            projected,
+            stage=f"{stage_name} attempt {attempt}" if attempt > 1 else stage_name,
+        )
+
         with timed(trace, f"{stage_name}.attempt{attempt}") as stage:
             result = await complete(
                 system_prompt,
@@ -231,6 +248,11 @@ async def call_structured(
                 json_mode=True,
             )
             trace.upstream_calls += 1
+            # Record what the provider actually charged, not the estimate.
+            token_limiter.record(
+                client_key,
+                int(result["usage"].get("total_tokens") or projected),
+            )
             last_raw = result["text"]
             used_model = result["model"]
             elapsed += result["elapsed_ms"]

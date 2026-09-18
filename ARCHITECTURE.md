@@ -80,6 +80,34 @@ from citation validity, claim coverage, evidence relevance, input parse rate,
 context completeness, and whether disconfirming evidence was sought. A chunked
 run scores lower by construction, because no single call saw everything.
 
+**The output contract is a compact type sketch, not JSON Schema.** Embedding
+`model_json_schema()` was the obvious choice and cost 43-64% of each system
+prompt: `{"title": "Summary", "type": "string", "maxLength": 4000}` spends a
+dozen tokens on what `"summary": string` says in three, and `$defs`/`$ref`
+indirection makes the model resolve pointers before it can see the shape. On a
+tokens-per-minute ceiling that overhead is the difference between a request
+succeeding and a repair attempt exhausting the minute's allowance. The compact
+rendering is ~63% smaller and pydantic still enforces the real contract after
+the response arrives.
+
+**The rate limiter counts tokens, not requests.** Requests per minute is easy to
+model and the wrong constraint. Groq's free tier allows 30 requests/min but
+8,000 tokens/min for a chat model, and this application's requests are large, so
+the token ceiling binds first. Counting requests meant repair attempts were sent
+into a budget already spent, and the caller got an upstream 429 naming a limit
+the application had never heard of. The budget is now tracked locally, checked
+before every attempt including repairs, and adopted from the provider's
+`x-ratelimit-*` headers so it tracks the account in use rather than a number
+compiled into the source.
+
+**Unusable models fail by name, immediately.** The provider lists every model a
+key can call, including classifiers and speech models. Selecting
+`meta-llama/llama-prompt-guard-2-86m` -- a 512-token injection classifier --
+previously produced "the global context alone needs 61 tokens of the 0
+available", which is accurate and useless. Non-chat families and windows below a
+usable threshold are now rejected up front with the reason and a working
+alternative, and `/api/models` marks each entry.
+
 **Runtime model metadata is authoritative.** The static context-window table is
 a cold-start fallback. `GET /v1/models` reports the real window per model, and
 that value wins — a table baked into source is wrong the moment a provider

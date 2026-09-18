@@ -55,6 +55,31 @@ Model IDs churn, so the app never trusts a baked-in list. `GET /api/models`
 returns the live list for your key, and pointing `GROQ_MODEL` at a model known
 to be retired produces an error naming the replacement.
 
+### Not every model in that list is a chat model
+
+The provider's `/models` endpoint returns everything your key can call —
+including classifiers, speech-to-text and text-to-speech. Picking one of those
+does not work, and it is an easy mistake because they look like normal entries.
+
+`meta-llama/llama-prompt-guard-2-86m`, for instance, is a 512-token
+prompt-injection classifier that returns a label. `GET /api/models` now marks
+every entry `usable: true/false` with a reason, and selecting an unusable one
+fails immediately with a named remedy instead of somewhere deep in the pipeline.
+
+### Tokens per minute is the limit you will actually hit
+
+Free-tier accounts are limited far more tightly by **tokens** per minute than by
+requests. `openai/gpt-oss-120b` allows 30 requests/min but only **8,000
+tokens/min**, and one request from this app costs several thousand — instructions,
+extracted facts, and a structured reply. Two or three requests in a minute can
+exhaust the allowance.
+
+The app now tracks that budget locally and refuses over-budget requests before
+they reach the provider, so a burst costs nothing upstream. It adopts the real
+limits from the provider's `x-ratelimit-*` response headers where they are sent,
+and falls back to `TOKEN_LIMIT_PER_MINUTE` / `TOKEN_LIMIT_PER_DAY`. Remaining
+budget is shown next to the model name in the UI.
+
 Because `GROQ_BASE_URL` is configurable and the wire format is
 OpenAI-compatible, this also runs against Ollama, llama.cpp, vLLM or LM Studio
 with no code changes. A loopback URL automatically bypasses any `HTTP_PROXY` in
@@ -123,7 +148,8 @@ All optional, all defaulting to sensible local-use values.
 
 | Control | Default | Variable |
 | --- | --- | --- |
-| Rate limit | 20/min, 500/day, shed locally | `RATE_LIMIT_PER_MINUTE`, `RATE_LIMIT_PER_DAY` |
+| Request limit | 20/min, 500/day, shed locally | `RATE_LIMIT_PER_MINUTE`, `RATE_LIMIT_PER_DAY` |
+| **Token budget** | 8k/min, 200k/day; adopted from provider headers | `TOKEN_LIMIT_PER_MINUTE`, `TOKEN_LIMIT_PER_DAY` |
 | Concurrency | 4 simultaneous upstream calls | `MAX_CONCURRENT_REQUESTS` |
 | Auth | off (pointless on localhost) | `API_TOKENS` |
 | CORS | loopback origins only | `CORS_ORIGINS` |
@@ -189,7 +215,7 @@ Errors carry a remediation, not just a status code:
 ## Tests
 
 ```bash
-.venv/bin/pytest                        # 213 tests, no network, no key, no cost
+.venv/bin/pytest                        # 217 tests, no network, no key, no cost
 node --test tests/markdown.test.mjs     # 22 renderer tests including XSS
 ```
 

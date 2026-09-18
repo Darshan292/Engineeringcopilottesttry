@@ -32,6 +32,7 @@ const els = {
   copyBtn: $("copy-btn"),
   downloadBtn: $("download-btn"),
   modelName: $("model-name"),
+  tokenBudget: $("token-budget"),
   statusDot: $("status-dot"),
   banner: $("banner"),
   bannerTitle: $("banner-title"),
@@ -100,6 +101,7 @@ async function loadConfig() {
 
     els.modelName.textContent = cfg.model || "unknown";
     els.modelName.parentElement.title = `Model: ${cfg.model}\nEndpoint: ${cfg.base_url}\nTemperature: ${cfg.temperature}\nMax tokens: ${cfg.max_tokens}`;
+    renderTokenBudget(cfg.token_budget);
 
     if (!cfg.api_key_configured) {
       els.statusDot.className = "dot dot-bad";
@@ -124,6 +126,38 @@ async function loadConfig() {
       " Is uvicorn running? Start it with <code>./run.sh</code> or <code>uvicorn backend.main:app --reload</code>.",
       "bad"
     );
+  }
+}
+
+/**
+ * Tokens per minute is the constraint a free-tier account actually hits --
+ * requests per minute is far more generous. Showing what is left makes a 429
+ * predictable instead of surprising.
+ */
+function renderTokenBudget(budget) {
+  if (!budget || !budget.limit_per_minute) {
+    els.tokenBudget.hidden = true;
+    return;
+  }
+  const left = budget.remaining_this_minute;
+  const limit = budget.limit_per_minute;
+  els.tokenBudget.hidden = false;
+  els.tokenBudget.textContent = `${left.toLocaleString()}/${limit.toLocaleString()} tok`;
+  els.tokenBudget.className =
+    "budget" + (left === 0 ? " budget-out" : left < limit * 0.3 ? " budget-low" : "");
+  els.tokenBudget.title =
+    `Token budget for this minute: ${left.toLocaleString()} of ${limit.toLocaleString()} left.\n` +
+    `Today: ${(budget.remaining_today ?? 0).toLocaleString()} of ` +
+    `${(budget.limit_per_day ?? 0).toLocaleString()} left.\n` +
+    `Requests are shed locally when the budget is spent, so no upstream quota is wasted.`;
+}
+
+async function refreshTokenBudget() {
+  try {
+    const res = await fetch("/api/config");
+    renderTokenBudget((await res.json()).token_budget);
+  } catch {
+    /* transient; the next run refreshes it */
   }
 }
 
@@ -611,6 +645,7 @@ async function run() {
     state.running = false;
     els.runLabel.textContent = "Run";
     updateCharCount();
+    refreshTokenBudget();
   }
 }
 

@@ -36,7 +36,12 @@ from ..core.redaction import (
     fail_closed,
     redact,
 )
-from ..core.tokens import build_budget
+from ..core.tokens import (
+    MIN_USABLE_CONTEXT,
+    build_budget,
+    non_chat_reason,
+    suggested_models,
+)
 from ..groq_client import GroqError
 from ..parsers.code import parse_code
 from ..parsers.logs import parse_logs
@@ -163,6 +168,7 @@ async def _run(
     warnings: list[str],
     extra_validators: list | None = None,
     context_note: str = "",
+    client_key: str = "local",
 ):
     """Budget, plan context, then run either a single call or map-reduce."""
     system_prompt = TOOL_PROMPTS[tool]
@@ -176,12 +182,52 @@ async def _run(
         refreshed = await refresh_model_registry_if_stale()
         stage.summary = {"refreshed": refreshed}
 
+    chosen = model or settings.groq_model
+
+    # A model that cannot do chat completions fails somewhere confusing and
+    # late. Say so here, by name, with something that works.
+    reason = non_chat_reason(chosen)
+    if reason:
+        raise GroqError(
+            f"'{chosen}' is {reason}. This application needs a chat model.",
+            status=422,
+            hint=(
+                f"Set GROQ_MODEL to one of: {', '.join(suggested_models())}. "
+                f"The provider's /models endpoint lists every model your key can call, "
+                f"including ones that do not serve chat completions."
+            ),
+        )
+
     with timed(trace, "budget") as stage:
-        budget = build_budget(model or settings.groq_model, system_prompt, settings.max_tokens)
+        budget = build_budget(chosen, system_prompt, settings.max_tokens)
         stage.summary = {
             "available_for_input": budget.available_for_input,
             "window_source": budget.window_source,
         }
+
+    if budget.context_window < MIN_USABLE_CONTEXT:
+        raise GroqError(
+            f"'{chosen}' has a {budget.context_window:,}-token context window, which is too "
+            f"small for this application. The instructions and output contract alone need "
+            f"about {budget.reserved_for_system:,} tokens before any of your input.",
+            status=422,
+            hint=(
+                f"At least ~{MIN_USABLE_CONTEXT:,} tokens are needed. Set GROQ_MODEL to one of: "
+                f"{', '.join(suggested_models())}. Window source: {budget.window_source}."
+            ),
+        )
+
+    if budget.available_for_input <= 0:
+        raise GroqError(
+            f"'{chosen}' has a {budget.context_window:,}-token window, and this request reserves "
+            f"{budget.reserved_for_output:,} for the reply plus {budget.reserved_for_system:,} for "
+            f"instructions, leaving nothing for your input.",
+            status=422,
+            hint=(
+                f"Either lower GROQ_MAX_TOKENS (currently {budget.reserved_for_output:,}) or use a "
+                f"model with a larger window: {', '.join(suggested_models())}."
+            ),
+        )
 
     if budget.window_source.startswith("conservative"):
         warnings.append(
@@ -224,6 +270,7 @@ async def _run(
             model=model,
             temperature=temperature,
             extra_validators=extra_validators,
+            client_key=client_key,
         )
         return result, plan
 
@@ -254,6 +301,7 @@ async def _run(
             model=model,
             temperature=temperature,
             stage_name=f"map.part{chunk.index + 1}",
+            client_key=client_key,
             # Domain validators (executing tests, validating OpenAPI) apply to
             # the final answer, not to a partial view of the input.
             extra_validators=None,
@@ -279,6 +327,7 @@ async def _run(
         temperature=temperature,
         stage_name="reduce",
         extra_validators=extra_validators,
+        client_key=client_key,
     )
 
     warnings.append(
@@ -304,7 +353,7 @@ def _cited_ids(tool: str, value) -> set[str]:
 # --- log / RCA ------------------------------------------------------------
 
 
-async def run_log_rca(raw: str, *, model=None, temperature=None, request_id=None) -> PipelineResult:
+async def run_log_rca(raw: str, *, model=None, temperature=None, request_id=None, client_key="local") -> PipelineResult:
     trace = Trace(request_id or uuid.uuid4().hex[:12])
     safe, diagnostics, warnings = await _preprocess_async("log-rca", raw, trace)
 
@@ -320,6 +369,7 @@ async def run_log_rca(raw: str, *, model=None, temperature=None, request_id=None
     result, plan = await _run(
         "log-rca", ir, ir.render("full"), RCAOutput,
         trace=trace, model=model, temperature=temperature, warnings=warnings,
+        client_key=client_key,
     )
     output = result.value
 
@@ -360,7 +410,7 @@ async def run_log_rca(raw: str, *, model=None, temperature=None, request_id=None
 # --- postmortem -----------------------------------------------------------
 
 
-async def run_postmortem(raw: str, *, model=None, temperature=None, request_id=None) -> PipelineResult:
+async def run_postmortem(raw: str, *, model=None, temperature=None, request_id=None, client_key="local") -> PipelineResult:
     trace = Trace(request_id or uuid.uuid4().hex[:12])
     safe, diagnostics, warnings = await _preprocess_async("postmortem", raw, trace)
 
@@ -408,7 +458,7 @@ async def run_postmortem(raw: str, *, model=None, temperature=None, request_id=N
     result, plan = await _run(
         "postmortem", ir, ir.render("full"), PostmortemOutput,
         trace=trace, model=model, temperature=temperature, warnings=warnings,
-        extra_validators=[check_roles],
+        extra_validators=[check_roles], client_key=client_key,
     )
     output = result.value
 
@@ -447,7 +497,7 @@ async def run_postmortem(raw: str, *, model=None, temperature=None, request_id=N
 # --- unit tests -----------------------------------------------------------
 
 
-async def run_unit_tests(raw: str, *, model=None, temperature=None, request_id=None) -> PipelineResult:
+async def run_unit_tests(raw: str, *, model=None, temperature=None, request_id=None, client_key="local") -> PipelineResult:
     trace = Trace(request_id or uuid.uuid4().hex[:12])
     safe, diagnostics, warnings = await _preprocess_async("unit-tests", raw, trace)
 
@@ -499,7 +549,7 @@ async def run_unit_tests(raw: str, *, model=None, temperature=None, request_id=N
     result, plan = await _run(
         "unit-tests", ir, ir.render("full"), UnitTestOutput,
         trace=trace, model=model, temperature=temperature, warnings=warnings,
-        extra_validators=[check_execution],
+        extra_validators=[check_execution], client_key=client_key,
     )
     output = result.value
     execution = execution_holder.get("report")
@@ -547,7 +597,7 @@ async def run_unit_tests(raw: str, *, model=None, temperature=None, request_id=N
 # --- API docs -------------------------------------------------------------
 
 
-async def run_api_docs(raw: str, *, model=None, temperature=None, request_id=None) -> PipelineResult:
+async def run_api_docs(raw: str, *, model=None, temperature=None, request_id=None, client_key="local") -> PipelineResult:
     trace = Trace(request_id or uuid.uuid4().hex[:12])
     safe, diagnostics, warnings = await _preprocess_async("api-docs", raw, trace)
 
@@ -579,7 +629,7 @@ async def run_api_docs(raw: str, *, model=None, temperature=None, request_id=Non
     result, plan = await _run(
         "api-docs", ir, ir.render("full"), APIDocOutput,
         trace=trace, model=model, temperature=temperature, warnings=warnings,
-        extra_validators=[check_openapi],
+        extra_validators=[check_openapi], client_key=client_key,
     )
     output = result.value
     openapi_report = openapi_holder.get("report")

@@ -22,6 +22,7 @@ from ..governance import (
     enforce_rate_limit,
     limiter,
     model_policy,
+    token_limiter,
 )
 from ..groq_client import GroqError, list_models
 from ..pipeline.tools import PIPELINES
@@ -92,8 +93,16 @@ async def _handle(tool: str, request: Request, body: ToolRequest, authorization:
         # burst of simultaneous provider requests.
         async with concurrency_slot():
             result = await PIPELINES[tool](
-                body.input, model=model, temperature=temperature, request_id=request_id
+                body.input,
+                model=model,
+                temperature=temperature,
+                request_id=request_id,
+                client_key=_client_key(request),
             )
+    except GovernanceError as exc:
+        # Raised mid-pipeline by the token budget, including between repairs.
+        log.warning("rid=%s tool=%s shed: %s", request_id, tool, exc.message)
+        return _error(exc.message, exc.status, exc.hint, request_id, exc.headers)
     except GroqError as exc:
         log.warning("rid=%s tool=%s failed: %s", request_id, tool, exc.message)
         return _error(exc.message, exc.status, exc.hint, request_id)
@@ -175,6 +184,7 @@ async def config(request: Request):
         **settings.public_dict(),
         "governance": {**model_policy.public(), **auth_policy.public()},
         "rate_limit": limiter.snapshot(_client_key(request)),
+        "token_budget": token_limiter.snapshot(_client_key(request)),
     }
 
 

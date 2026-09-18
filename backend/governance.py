@@ -208,6 +208,165 @@ limiter = SlidingWindowLimiter(
     per_day=_env_int("RATE_LIMIT_PER_DAY", 500),
 )
 
+
+class TokenBudgetLimiter:
+    """Sliding-window limiter over TOKENS, not requests.
+
+    Requests per minute is the limit that is easy to model and the wrong one to
+    model. On Groq's free tier a chat model allows 30 requests/minute but only
+    8,000 tokens/minute, and this application's requests are large: a system
+    prompt plus extracted facts plus a structured response is several thousand
+    tokens, so the token ceiling binds long before the request ceiling does.
+
+    Counting only requests meant the app cheerfully sent a second and third
+    repair attempt into a budget that was already spent, and the user got an
+    upstream 429 naming a limit the application had never heard of. This tracks
+    the constraint that actually binds, refuses locally before spending a round
+    trip, and says how long to wait.
+
+    Usage is recorded from the provider's own `usage.total_tokens` where
+    available, and from the local estimate before the call so that concurrent
+    requests cannot all pass the check on stale state.
+    """
+
+    def __init__(self, per_minute: int, per_day: int):
+        self.per_minute = per_minute
+        self.per_day = per_day
+        self._lock = threading.Lock()
+        # (timestamp, tokens) pairs.
+        self._minute: dict[str, deque] = defaultdict(deque)
+        self._day: dict[str, deque] = defaultdict(deque)
+
+    def _trim(self, client: str, now: float) -> tuple[deque, deque]:
+        minute, day = self._minute[client], self._day[client]
+        while minute and now - minute[0][0] > 60:
+            minute.popleft()
+        while day and now - day[0][0] > 86_400:
+            day.popleft()
+        return minute, day
+
+    def remaining(self, client: str) -> tuple[int, int]:
+        now = time.time()
+        with self._lock:
+            minute, day = self._trim(client, now)
+            used_minute = sum(t for _, t in minute)
+            used_day = sum(t for _, t in day)
+        return (
+            max(0, self.per_minute - used_minute) if self.per_minute else 1 << 30,
+            max(0, self.per_day - used_day) if self.per_day else 1 << 30,
+        )
+
+    def check(self, client: str, estimated_tokens: int) -> tuple[bool, str, int]:
+        """Would a request of this size fit? Returns (allowed, reason, retry_after)."""
+        now = time.time()
+        with self._lock:
+            minute, day = self._trim(client, now)
+            used_minute = sum(t for _, t in minute)
+            used_day = sum(t for _, t in day)
+
+            if self.per_minute and used_minute + estimated_tokens > self.per_minute:
+                oldest = minute[0][0] if minute else now
+                return (
+                    False,
+                    f"{used_minute:,} of {self.per_minute:,} tokens/minute already used; "
+                    f"this request needs about {estimated_tokens:,} more",
+                    max(1, int(61 - (now - oldest))),
+                )
+            if self.per_day and used_day + estimated_tokens > self.per_day:
+                oldest = day[0][0] if day else now
+                return (
+                    False,
+                    f"{used_day:,} of {self.per_day:,} tokens/day already used; "
+                    f"this request needs about {estimated_tokens:,} more",
+                    max(1, int(86_401 - (now - oldest))),
+                )
+        return True, "", 0
+
+    def record(self, client: str, tokens: int) -> None:
+        if tokens <= 0:
+            return
+        now = time.time()
+        with self._lock:
+            self._minute[client].append((now, tokens))
+            self._day[client].append((now, tokens))
+
+    def snapshot(self, client: str) -> dict:
+        remaining_minute, remaining_day = self.remaining(client)
+        return {
+            "limit_per_minute": self.per_minute,
+            "remaining_this_minute": remaining_minute,
+            "limit_per_day": self.per_day,
+            "remaining_today": remaining_day,
+        }
+
+
+# Matched to the Groq free tier's chat-model ceiling (8,000 TPM / 200,000 TPD
+# for gpt-oss-120b). Raise these if your account has a higher allowance --
+# they exist to fail fast locally, not to be conservative for its own sake.
+token_limiter = TokenBudgetLimiter(
+    per_minute=_env_int("TOKEN_LIMIT_PER_MINUTE", 8_000),
+    per_day=_env_int("TOKEN_LIMIT_PER_DAY", 200_000),
+)
+
+
+def _parse_limit_header(value: str | None) -> int | None:
+    """Parse a rate-limit header value like '8000' or '200000'."""
+    if not value:
+        return None
+    try:
+        return int(float(value.strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def adopt_provider_limits(headers) -> dict | None:
+    """Tune the local token budget from the provider's own rate-limit headers.
+
+    Limits differ per model -- on Groq's free tier gpt-oss-120b allows 8,000
+    tokens/minute while prompt-guard allows 15,000, and a day's allowance
+    differs too. Any number compiled into this application is therefore a guess
+    about someone else's account.
+
+    OpenAI-compatible providers report the real values on every response
+    (`x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens`). Adopting them
+    makes the local budget track the account actually in use, which is the same
+    principle applied to quota that the model registry applies to context
+    windows. Headers absent, configured defaults stand.
+    """
+    limit = _parse_limit_header(headers.get("x-ratelimit-limit-tokens"))
+    remaining = _parse_limit_header(headers.get("x-ratelimit-remaining-tokens"))
+    if limit is None or limit <= 0:
+        return None
+
+    changed = limit != token_limiter.per_minute
+    token_limiter.per_minute = limit
+
+    day_limit = _parse_limit_header(headers.get("x-ratelimit-limit-tokens-day"))
+    if day_limit and day_limit > 0:
+        token_limiter.per_day = day_limit
+
+    return {
+        "limit_per_minute": limit,
+        "provider_remaining": remaining,
+        "adopted": changed,
+    }
+
+
+def enforce_token_budget(client: str, estimated_tokens: int, *, stage: str = "this request") -> None:
+    allowed, reason, retry_after = token_limiter.check(client, estimated_tokens)
+    if not allowed:
+        raise GovernanceError(
+            f"Token budget exceeded before {stage}: {reason}.",
+            status=429,
+            hint=(
+                f"Free-tier accounts are limited by tokens per minute, not requests. "
+                f"Wait {retry_after}s and retry, use a smaller input, or raise "
+                f"TOKEN_LIMIT_PER_MINUTE if your account allows more. This was refused "
+                f"locally, so no quota was spent upstream."
+            ),
+            headers={"Retry-After": str(retry_after)},
+        )
+
 # Bounds how many upstream calls are in flight at once. Without it, twenty
 # concurrent browser tabs become twenty simultaneous Groq calls and a 429.
 _MAX_CONCURRENCY = _env_int("MAX_CONCURRENT_REQUESTS", 4)

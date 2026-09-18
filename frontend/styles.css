@@ -601,3 +601,18 @@ body {
 }
 .stage-bar .nm { flex: 0 0 150px; color: var(--text-dim); }
 .stage-bar .ms { color: var(--text-faint); }
+
+
+/* ---------- token budget indicator ---------- */
+
+.budget {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding-left: 8px;
+  margin-left: 2px;
+  border-left: 1px solid var(--border);
+  color: var(--text-faint);
+}
+.budget[hidden] { display: none; }
+.budget-low { color: var(--warn); }
+.budget-out { color: var(--bad); }

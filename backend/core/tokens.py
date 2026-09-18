@@ -181,6 +181,44 @@ CONTEXT_WINDOWS: dict[str, int] = {
 
 DEFAULT_CONTEXT_WINDOW = 8_192
 
+# The smallest window in which this application can do anything at all: the
+# system prompt plus the output contract is ~1,500-2,300 tokens before any
+# input, and a useful reply needs room too.
+MIN_USABLE_CONTEXT = 6_000
+
+# Model families a provider lists that cannot serve chat completions. The
+# /models endpoint returns everything an account can call -- classifiers,
+# speech-to-text, text-to-speech, moderation -- and selecting one produces a
+# confusing failure deep in the pipeline rather than an obvious one up front.
+_NON_CHAT_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("prompt-guard", "a prompt-injection classifier that returns a label, not chat completions"),
+    ("llama-guard", "a content-safety classifier that returns a label, not chat completions"),
+    ("whisper", "a speech-to-text model"),
+    ("-tts", "a text-to-speech model"),
+    ("playai-tts", "a text-to-speech model"),
+    ("embed", "an embedding model"),
+    ("moderation", "a moderation classifier"),
+    ("-asr", "a speech recognition model"),
+)
+
+
+def non_chat_reason(model: str) -> str | None:
+    """Why this model cannot serve this application, or None if it can."""
+    lowered = model.lower()
+    for marker, description in _NON_CHAT_PATTERNS:
+        if marker in lowered:
+            return description
+    return None
+
+
+def suggested_models() -> list[str]:
+    """Chat models known to work, preferring what the provider confirmed."""
+    known = [m for m in registry._windows if non_chat_reason(m) is None and registry._windows[m] >= MIN_USABLE_CONTEXT]
+    if known:
+        # Largest window first: more headroom means fewer compressions.
+        return sorted(known, key=lambda m: -registry._windows[m])[:4]
+    return ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"]
+
 
 class ModelRegistry:
     """Runtime model metadata, treated as authoritative over the static table.

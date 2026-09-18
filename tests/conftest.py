@@ -171,12 +171,25 @@ class StubModel:
             payload = VALID_RESPONSES[self.tool]
 
         text = payload if isinstance(payload, str) else json.dumps(payload)
+
+        # Report usage proportional to what was actually sent. A fixed small
+        # number made every cost and budget assertion meaningless -- the token
+        # limiter would never fill, so a test could not tell a working budget
+        # from a broken one.
+        from backend.core.tokens import estimate_tokens
+
+        prompt_tokens = estimate_tokens(system_prompt) + estimate_tokens(user_content)
+        completion_tokens = estimate_tokens(text)
         return {
             "text": text,
             "model": "stub-model",
             "finish_reason": "stop",
             "elapsed_ms": 42,
-            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
         }
 
 
@@ -229,11 +242,19 @@ def reset_process_state():
     Without this, a test's result depended on which tests ran before it.
     """
     from backend.core.tokens import calibrator, registry
-    from backend.governance import limiter
+    from backend.governance import limiter, token_limiter
+
+    # The token budget defaults to the Groq free tier's 8,000/minute, which a
+    # multi-call test legitimately exceeds. Tests get an effectively unlimited
+    # budget; `test_api.py` exercises the real ceiling explicitly.
+    token_limiter.per_minute = 10_000_000
+    token_limiter.per_day = 10_000_000
 
     def clear():
         limiter._minute.clear()
         limiter._day.clear()
+        token_limiter._minute.clear()
+        token_limiter._day.clear()
         with calibrator._lock:
             calibrator._models.clear()
         with registry._lock:
