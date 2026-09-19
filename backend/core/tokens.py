@@ -141,6 +141,19 @@ class ModelCalibration:
         }
 
 
+# A routing or agentic model does not send what we composed. The provider
+# prepends its own instructions and the tool schemas the agent may call, none of
+# which appear in the text this application built, so an estimate measured from
+# our own messages is systematically low -- observed at roughly 2.3x on Groq's
+# compound models (6,044 estimated against 13,761 counted).
+#
+# Starting such a model at 1.0 means the first request is budgeted at under half
+# its real cost, is accepted by the local limiter, and is then refused by the
+# provider. This is a prior, not a constant: the first real observation moves
+# it, and a model that turns out cheaper than this converges down.
+ROUTING_MODEL_PRIOR = 2.3
+
+
 class Calibrator:
     """Process-wide, per-model calibration. Thread-safe, in-memory only."""
 
@@ -150,7 +163,14 @@ class Calibrator:
 
     def for_model(self, model: str) -> ModelCalibration:
         with self._lock:
-            return self._models.setdefault(model, ModelCalibration())
+            existing = self._models.get(model)
+            if existing is not None:
+                return existing
+            from ..config import is_routing_model
+
+            fresh = ModelCalibration(ratio=ROUTING_MODEL_PRIOR if is_routing_model(model) else 1.0)
+            self._models[model] = fresh
+            return fresh
 
     def observe(self, model: str, estimated: int, actual: int) -> None:
         with self._lock:
@@ -172,7 +192,9 @@ calibrator = Calibrator()
 # Known context windows. Unknown models fall back to the conservative default
 # rather than assuming a large window and failing at request time.
 CONTEXT_WINDOWS: dict[str, int] = {
-    "qwen/qwen3.6-27b": 131_072,
+    "qwen/qwen3.8-27b": 131_042,
+    "groq/compound": 131_072,
+    "groq/compound-mini": 131_072,
     "openai/gpt-oss-120b": 131_072,
     "openai/gpt-oss-20b": 131_072,
     "llama-3.3-70b-versatile": 131_072,
@@ -222,7 +244,7 @@ def suggested_models() -> list[str]:
     if known:
         # Largest window first: more headroom means fewer compressions.
         return sorted(known, key=lambda m: -registry._windows[m])[:4]
-    return ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"]
+    return ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
 
 class ModelRegistry:

@@ -200,6 +200,56 @@ the name→placeholder table is never serialized. The model cannot leak a name i
 was never shown. A second check rejects any participant role that is not a real
 transcript participant.
 
+## Rate limits, and why they are not errors
+
+The pre-flight limiter and the post-flight back-off solve different halves of
+the same problem and neither is sufficient alone.
+
+The limiter is an estimate made before the call. It can be wrong in both
+directions, and for a routing or agentic model it is wrong by roughly 2x,
+because the provider prepends tool schemas and internal instructions that the
+text we composed gives no hint of. So the estimate is not trusted as the last
+word: a `429` is read for the delay the provider states, waited out, and
+retried. Up to six times, against the same `MAX_TOTAL_WAIT_SECONDS` budget the
+local pacing draws on, so one request can never wait longer in total than was
+allowed.
+
+Whose cost it is matters. A 429 naming a different model is the truth about a
+router -- it really did dispatch there and really did pay that -- and is
+something else for a plain chat model: a shared organisation bucket, a proxy,
+a mislabelled gateway. Attributing it either way was worse than it sounds: the
+inflated system reserve wiped out the input budget for every later request in
+the process, and the tools started refusing inputs that had fit a minute
+earlier. So the cost is only attributed when the model named is the one called,
+or the one called is a known router.
+
+The 429 body is also the only reliable teacher for such a model. It states the
+limit that bound, the model that actually ran, and what the provider counted the
+call as costing. A successful response would report usage — but while the
+estimate is too low there are no successful responses, so calibration could
+never converge. Reading the failure breaks that deadlock.
+
+A limit set in the environment is treated as a ceiling rather than a starting
+guess. Adoption used to overwrite it, which meant an operator who set
+`TOKEN_LIMIT_PER_MINUTE=8000` watched it become 70,000 after the first response.
+Headers may now lower the effective budget and never lift it above what was
+configured — particularly important for a routing model, whose advertised limit
+belongs to the router while the binding one belongs to whatever it dispatched
+to.
+
+### Splitting does not stretch an allowance
+
+Map-reduce answers "this input is larger than one call". It is the wrong tool
+for "one call is larger than one minute's allowance", and treating the two as
+the same problem costs real quota: each part re-sends the system prompt and
+re-reserves the output, so N parts cost about N times that fixed overhead.
+
+When the fixed overhead already dominates — at `TOKEN_LIMIT_PER_MINUTE=8000`,
+`groq/compound` leaves roughly 512 tokens per call for actual input against
+`openai/gpt-oss-120b`'s 2,450 — the app says so in a warning rather than
+splitting into something both slower and more expensive. The only real remedies
+are a larger allowance or a cheaper model, and the warning names both.
+
 ## Honest limits
 
 These are real and not papered over:
@@ -229,6 +279,11 @@ These are real and not papered over:
   that trust is misplaced.
 - **The rate limiter is per-process.** In-memory, so it is load shedding for a
   single instance, not a distributed quota.
+- **The routing-model correction is a prior, not a measurement.** `2.3x` comes
+  from one observed pair (6,044 estimated against 13,761 counted by Groq for
+  `groq/compound`). It is a starting point that the first real 429 or completion
+  moves; a different agentic model with a different internal prompt will differ,
+  and until it is observed the first call for it is budgeted on that guess.
 - **Confidence measures evidence quality, not correctness.** A well-evidenced
   wrong answer can still score high. The weights are a defensible starting
   point, not a calibrated model.

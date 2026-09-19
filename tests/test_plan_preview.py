@@ -86,12 +86,11 @@ def test_the_preview_matches_what_the_run_actually_does(client, for_tool, tool, 
     )
 
 
-def test_a_split_input_is_described_part_by_part(client, for_tool, monkeypatch):
+def test_a_split_input_is_described_part_by_part(client, for_tool, monkeypatch, shrink_window):
     """'How is it splitting' is answerable before the first call, not after."""
     from backend.core import tokens
 
-    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 12_000)
-    monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
+    shrink_window(12_000)
     for_tool("log-rca")
 
     body = client.post("/api/plan/log-rca", json={"input": _varied_log(600)}).json()
@@ -109,12 +108,11 @@ def test_a_split_input_is_described_part_by_part(client, for_tool, monkeypatch):
     assert "Nothing was dropped" in body["narrative"]
 
 
-def test_a_refused_plan_is_previewed_rather_than_raised(client, for_tool, monkeypatch):
+def test_a_refused_plan_is_previewed_rather_than_raised(client, for_tool, monkeypatch, shrink_window):
     """'It would be refused, here is why' is an answer, not an error."""
     from backend.core import chunking, tokens
 
-    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 8_000)
-    monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
+    shrink_window(8_000)
     monkeypatch.setattr(chunking, "DEFAULT_MAX_CHUNKS", 2)
     for_tool("unit-tests")
 
@@ -144,7 +142,7 @@ def test_an_unknown_tool_is_a_404(client, for_tool):
     assert client.post("/api/plan/nonsense", json={"input": "x"}).status_code == 404
 
 
-def test_the_promised_call_count_holds_for_a_split_input(client, for_tool, monkeypatch):
+def test_the_promised_call_count_holds_for_a_split_input(client, for_tool, monkeypatch, shrink_window):
     """The case that exposed a preview promising half the calls it made.
 
     On a small per-call budget the combine is a tree: thirteen partial answers
@@ -156,8 +154,7 @@ def test_the_promised_call_count_holds_for_a_split_input(client, for_tool, monke
     """
     from backend.core import tokens
 
-    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 8_000)
-    monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
+    shrink_window(8_000)
     stub = for_tool("log-rca")
 
     log = _varied_log(600)
@@ -231,19 +228,18 @@ def test_the_combine_budget_always_leaves_room_for_two_partials():
         assert calls < 16
 
 
-def test_the_projected_duration_counts_every_combine_round(client, for_tool, monkeypatch):
+def test_the_projected_duration_counts_every_combine_round(client, for_tool, monkeypatch, shrink_window):
     """Understating the calls understated the wait that decides refusals."""
     from backend.core import tokens
     from backend.core.chunking import plan_context
     from backend.core.tokens import build_budget
     from backend.parsers.logs import parse_logs
 
-    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 8_000)
-    monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
+    shrink_window(8_000)
 
     ir = parse_logs(_varied_log(600))
     plan = plan_context(
-        ir, build_budget("qwen/qwen3.6-27b", "sys", 2_200, token_allowance_per_minute=8_000)
+        ir, build_budget("qwen/qwen3.8-27b", "sys", 2_200, token_allowance_per_minute=8_000)
     )
     if plan.strategy != "map_reduce":
         pytest.skip("this budget no longer produces a split plan")

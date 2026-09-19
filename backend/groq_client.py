@@ -8,12 +8,37 @@ turning Groq's HTTP failures into messages that tell you what to actually do.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import re
 import time
 from typing import Any
 
 import httpx
 
 from .config import DEFAULT_MODEL, RETIRED_MODELS, settings
+
+log = logging.getLogger("copilot.groq")
+
+# A 429 is the provider telling us when to come back, not that the work cannot
+# be done. Waiting it out is the whole difference between "this application
+# needs a paid tier" and "this application is slower on a free tier", and the
+# second is the product this is meant to be.
+MAX_RATE_LIMIT_RETRIES = 6
+
+# Cap on a single wait between retries. A provider asking for longer than this
+# is describing a quota problem rather than a burst, and the caller is better
+# told than left on a hanging request.
+MAX_SINGLE_RETRY_WAIT = 65.0
+
+
+async def _sleep(seconds: float) -> None:
+    """Indirection so tests can observe the wait without serving it.
+
+    Patching `asyncio.sleep` itself would reach every other coroutine in the
+    process; this keeps the seam local to the client.
+    """
+    await asyncio.sleep(seconds)
 
 
 class GroqError(Exception):
@@ -113,15 +138,23 @@ def _translate_http_error(response: httpx.Response, model: str) -> GroqError:
         return GroqError(f"Model '{model}' is unavailable: {detail}", status=502, hint=hint)
 
     if code == 429:
-        retry_after = response.headers.get("retry-after")
-        wait = f" Retry after {retry_after}s." if retry_after else ""
+        # Only reached once the retries below are exhausted, so the advice is
+        # about quota rather than about waiting.
+        routed = _routed_model(detail)
+        routing_note = (
+            f" You selected '{model}', which routed to '{routed}'; the limit that bound is "
+            f"that model's, not the one you configured."
+            if routed and routed != model
+            else ""
+        )
         return GroqError(
-            f"Groq rate limit hit: {detail}",
+            f"Groq rate limit hit and did not clear after waiting: {detail}",
             status=429,
             hint=(
-                f"The free tier is roughly 30 requests/min and 1,000/day per model.{wait} "
-                f"Wait a moment, or switch GROQ_MODEL to a different free-tier model to "
-                f"use a separate bucket."
+                f"This request waited for the allowance to roll and the limit was still "
+                f"reached.{routing_note} Lower TOKEN_LIMIT_PER_MINUTE so this app paces itself "
+                f"below the real ceiling, wait a minute, or switch GROQ_MODEL to a model with a "
+                f"separate bucket."
             ),
         )
 
@@ -142,6 +175,94 @@ def _translate_http_error(response: httpx.Response, model: str) -> GroqError:
     return GroqError(f"Groq request failed ({code}): {detail}", status=502)
 
 
+
+def _learn_from_rate_limit(model: str, detail: str, body: dict, max_tokens: int | None) -> None:
+    """Take the provider's own arithmetic from a 429 and believe it.
+
+    The body names the limit that bound, the model that bound it, and what this
+    call was counted as costing. That last figure is the valuable one: for an
+    agentic or routing model the wire cost is a multiple of the text we sent,
+    because the provider prepends tool schemas and internal instructions we
+    never see. Our estimate cannot converge on that from successful calls,
+    because while the estimate is too low the calls are not successful.
+    """
+    try:
+        from .config import is_routing_model
+        from .core.tokens import calibrator, estimate_messages_tokens
+        from .governance import adopt_limit_from_rate_limit_error
+
+        learned = adopt_limit_from_rate_limit_error(model, detail)
+        if not learned:
+            return
+
+        requested = learned.get("requested")
+        routed_to = learned.get("routed_to")
+        # Only attribute the cost when it is genuinely this model's. A 429 that
+        # names a different model is the truth about `model` when `model` is a
+        # router that dispatched to it, and is something else entirely -- a
+        # shared organisation bucket, a mislabelled proxy -- when it is not.
+        # Believing it in that second case inflates the estimate for a model
+        # that never paid the cost, and the inflated system reserve can wipe out
+        # the whole input budget for every later request in the process.
+        attributable = (
+            not routed_to
+            or routed_to == model
+            or is_routing_model(model)
+        )
+        if requested and attributable:
+            ours = estimate_messages_tokens(body.get("messages") or []) + (max_tokens or 0)
+            if ours > 0:
+                calibrator.observe(model, ours, requested)
+        elif requested:
+            log.info(
+                "not calibrating %s from a limit reached by %s; %s is not a routing model",
+                model, routed_to, model,
+            )
+        if learned.get("routed_to") and learned["routed_to"] != model:
+            log.info("%s routed to %s; limit %s applies to the latter",
+                     model, learned["routed_to"], learned.get("limit"))
+    except Exception:  # never let learning break the call path
+        pass
+
+
+
+def _routed_model(detail: str) -> str | None:
+    """The model a 429 says actually ran, which may not be the one requested."""
+    match = re.search(r"for model `([^`]+)`", detail or "")
+    return match.group(1) if match else None
+
+
+def _retry_delay(response: httpx.Response, detail: str) -> float | None:
+    """How long the provider wants us to wait, from whichever source states it.
+
+    Three sources, most authoritative first: the `retry-after` header, the
+    `x-ratelimit-reset-tokens` header, and the sentence in the error body
+    ("Please try again in 4.303999999s"). Groq populates the last one even when
+    it omits the first, and a fixed backoff instead of the stated figure either
+    wastes allowance or comes back too early.
+    """
+    header = response.headers.get("retry-after")
+    if header:
+        try:
+            return max(0.0, float(header.strip()))
+        except ValueError:
+            pass
+
+    reset = response.headers.get("x-ratelimit-reset-tokens")
+    if reset:
+        match = re.match(r"([\d.]+)\s*(ms|s|m)?", reset.strip())
+        if match:
+            value = float(match.group(1))
+            unit = match.group(2) or "s"
+            return {"ms": value / 1000, "s": value, "m": value * 60}[unit]
+
+    match = re.search(r"try again in ([\d.]+)\s*(ms|s)?", detail or "", re.IGNORECASE)
+    if match:
+        value = float(match.group(1))
+        return value / 1000 if match.group(2) == "ms" else value
+    return None
+
+
 async def complete(
     system_prompt: str,
     user_content: str,
@@ -150,6 +271,7 @@ async def complete(
     temperature: float | None = None,
     max_tokens: int | None = None,
     json_mode: bool = False,
+    max_wait_seconds: float | None = None,
 ) -> dict[str, Any]:
     """Run one chat completion. Returns the text plus usage/latency metadata.
 
@@ -176,51 +298,84 @@ async def complete(
         body["response_format"] = {"type": "json_object"}
 
     started = time.perf_counter()
-    try:
-        async with _client() as client:
-            response = await client.post(
-                f"{settings.groq_base_url}/chat/completions",
-                headers=_auth_headers(),
-                json=body,
-            )
-    except httpx.TimeoutException as exc:
-        raise GroqError(
-            f"Groq did not respond within {settings.timeout_seconds:.0f}s.",
-            status=504,
-            hint="Try a shorter input, or raise GROQ_TIMEOUT_SECONDS in .env.",
-        ) from exc
-    except httpx.HTTPError as exc:
-        raise GroqError(
-            f"Could not reach Groq: {exc}",
-            status=502,
-            hint="Check your network connection and that GROQ_BASE_URL is correct.",
-        ) from exc
+    rate_limit_waits = 0.0
+    rate_limit_retries = 0
 
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    async def post() -> httpx.Response:
+        try:
+            async with _client() as client:
+                return await client.post(
+                    f"{settings.groq_base_url}/chat/completions",
+                    headers=_auth_headers(),
+                    json=body,
+                )
+        except httpx.TimeoutException as exc:
+            raise GroqError(
+                f"Groq did not respond within {settings.timeout_seconds:.0f}s.",
+                status=504,
+                hint="Try a shorter input, or raise GROQ_TIMEOUT_SECONDS in .env.",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise GroqError(
+                f"Could not reach Groq: {exc}",
+                status=502,
+                hint="Check your network connection and that GROQ_BASE_URL is correct.",
+            ) from exc
 
-    # The provider states its real limits for this model and account on every
-    # response, including error responses. Adopt them so the local budget is
-    # not a guess compiled into the source.
-    try:
-        from .governance import adopt_provider_limits
+    # A rate limit is a "come back shortly", not a refusal. The provider states
+    # when, so the loop waits that long and tries again instead of turning a
+    # four-second pause into a failed request. Each 429 also teaches us the real
+    # ceiling and the real cost of this call, which is the only way an estimate
+    # for a routing or agentic model can ever improve -- the request never
+    # succeeds, so no usage is ever reported to learn from.
+    if max_wait_seconds is None:
+        from .governance import MAX_TOTAL_WAIT_SECONDS
 
-        adopt_provider_limits(response.headers)
-    except Exception:
-        pass
+        budget_left = float(MAX_TOTAL_WAIT_SECONDS)
+    else:
+        budget_left = max(0.0, max_wait_seconds)
+    while True:
+        response = await post()
+
+        try:
+            from .governance import adopt_provider_limits
+
+            adopt_provider_limits(response.headers)
+        except Exception:
+            pass
+
+        if response.status_code != 429:
+            break
+
+        detail = _extract_api_error(response)
+        _learn_from_rate_limit(chosen_model, detail, body, max_tokens)
+
+        delay = _retry_delay(response, detail)
+        if delay is None or rate_limit_retries >= MAX_RATE_LIMIT_RETRIES:
+            break
+        # A provider asking for longer than one window is describing exhausted
+        # quota, not a burst; waiting it out would hang the request for minutes
+        # with nothing to show.
+        delay = min(delay + 0.25, MAX_SINGLE_RETRY_WAIT)
+        if delay > budget_left:
+            break
+
+        rate_limit_retries += 1
+        rate_limit_waits += delay
+        budget_left -= delay
+        log.info(
+            "rate limited by %s; waiting %.1fs and retrying (attempt %d of %d)",
+            _routed_model(detail) or chosen_model, delay, rate_limit_retries, MAX_RATE_LIMIT_RETRIES,
+        )
+        await _sleep(delay)
 
     # Not every OpenAI-compatible server implements response_format. Drop it
     # and retry once rather than failing a request over an optional flag.
     if response.status_code == 400 and json_mode and "response_format" in (response.text or ""):
         body.pop("response_format", None)
-        try:
-            async with _client() as client:
-                response = await client.post(
-                    f"{settings.groq_base_url}/chat/completions",
-                    headers=_auth_headers(),
-                    json=body,
-                )
-        except httpx.HTTPError as exc:
-            raise GroqError(f"Could not reach Groq: {exc}", status=502) from exc
+        response = await post()
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
 
     if response.status_code >= 400:
         raise _translate_http_error(response, chosen_model)
@@ -275,6 +430,10 @@ async def complete(
             "completion_tokens": usage.get("completion_tokens"),
             "total_tokens": usage.get("total_tokens"),
         },
+        # Time spent held back by the provider rather than working, reported so
+        # a slow request is explicable instead of mysterious.
+        "rate_limited_seconds": round(rate_limit_waits, 2),
+        "rate_limit_retries": rate_limit_retries,
     }
 
 

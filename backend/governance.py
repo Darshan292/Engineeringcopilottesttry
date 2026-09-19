@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
+import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -35,6 +36,17 @@ def _env_int(name: str, default: int) -> int:
         return int(os.getenv(name) or default)
     except ValueError:
         return default
+
+
+def _env_is_set(name: str) -> bool:
+    """Whether the operator actually chose this value, or it defaulted.
+
+    The distinction matters for anything that can also be discovered at
+    runtime. A default is this application guessing; a value in `.env` is a
+    decision, and discovery must not silently overrule a decision.
+    """
+    raw = os.getenv(name)
+    return raw is not None and raw.strip() != ""
 
 
 def _env_list(name: str) -> list[str]:
@@ -363,6 +375,12 @@ class TokenBudgetLimiter:
 # Matched to the Groq free tier's chat-model ceiling (8,000 TPM / 200,000 TPD
 # for gpt-oss-120b). Raise these if your account has a higher allowance --
 # they exist to fail fast locally, not to be conservative for its own sake.
+# What the operator explicitly asked for, or None when they left it to us.
+# Kept separate from the limiter's live value, which provider discovery may
+# lower, so "what was configured" survives being tuned down at runtime.
+CONFIGURED_TPM: int | None = _env_int("TOKEN_LIMIT_PER_MINUTE", 8_000) if _env_is_set("TOKEN_LIMIT_PER_MINUTE") else None
+CONFIGURED_TPD: int | None = _env_int("TOKEN_LIMIT_PER_DAY", 200_000) if _env_is_set("TOKEN_LIMIT_PER_DAY") else None
+
 token_limiter = TokenBudgetLimiter(
     per_minute=_env_int("TOKEN_LIMIT_PER_MINUTE", 8_000),
     per_day=_env_int("TOKEN_LIMIT_PER_DAY", 200_000),
@@ -403,14 +421,26 @@ async def await_token_budget(
     wait = token_limiter.wait_needed(client, estimated_tokens)
 
     if wait < 0:
+        # Waiting cannot help, so say what would, with the specific numbers.
+        # "Rate limited, try later" for a request that can never fit sends
+        # people round a loop that has no exit.
+        configured = (
+            f"TOKEN_LIMIT_PER_MINUTE is set to {CONFIGURED_TPM:,} in your environment"
+            if CONFIGURED_TPM is not None and CONFIGURED_TPM <= token_limiter.per_minute
+            else f"the current allowance is {token_limiter.per_minute:,} tokens/minute"
+        )
         raise GovernanceError(
             f"A single call for {stage} needs about {estimated_tokens:,} tokens, more than the "
-            f"entire {token_limiter.per_minute:,}-token minute allowance. Waiting cannot help.",
+            f"entire {token_limiter.per_minute:,}-token minute allowance, so no amount of "
+            f"waiting or splitting makes it fit.",
             status=413,
             hint=(
-                "Paste a smaller excerpt, or use a model with a higher token allowance. "
-                "Raise TOKEN_LIMIT_PER_MINUTE if your account permits more than this "
-                "deployment assumes."
+                f"{configured}. Raise it to at least {int(estimated_tokens * 1.2):,} if your "
+                f"account allows, paste a smaller excerpt, or switch to a model whose per-call "
+                f"cost is lower. Note that a routing model such as groq/compound sends tool "
+                f"schemas and internal instructions alongside your text, so one call costs "
+                f"roughly twice what the visible input suggests; a plain chat model like "
+                f"openai/gpt-oss-120b does not."
             ),
         )
 
@@ -450,33 +480,91 @@ def _parse_limit_header(value: str | None) -> int | None:
 def adopt_provider_limits(headers) -> dict | None:
     """Tune the local token budget from the provider's own rate-limit headers.
 
-    Limits differ per model -- on Groq's free tier gpt-oss-120b allows 8,000
-    tokens/minute while prompt-guard allows 15,000, and a day's allowance
-    differs too. Any number compiled into this application is therefore a guess
-    about someone else's account.
+    Limits differ per model -- on Groq's free tier one chat model allows 8,000
+    tokens/minute and another 30,000, and a day's allowance differs too. Any
+    number compiled into this application is a guess about someone else's
+    account, so the provider's own headers are the better source.
 
-    OpenAI-compatible providers report the real values on every response
-    (`x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens`). Adopting them
-    makes the local budget track the account actually in use, which is the same
-    principle applied to quota that the model registry applies to context
-    windows. Headers absent, configured defaults stand.
+    With one hard exception: a limit set in the environment is never raised.
+    Adoption used to overwrite it outright, so an operator who wrote
+    TOKEN_LIMIT_PER_MINUTE=8000 watched the UI report 70,000 after the first
+    response and had no way to hold the budget down. Worse, the number the
+    provider advertises is not always the one that binds -- a routing model like
+    `groq/compound` reports its own generous allowance and then dispatches to an
+    underlying model with a much smaller one, and the 429 names a model the
+    caller never chose.
+
+    So headers may lower the effective ceiling and never lift it above what was
+    configured. Discovery informs the budget; it does not overrule a decision.
     """
     limit = _parse_limit_header(headers.get("x-ratelimit-limit-tokens"))
     remaining = _parse_limit_header(headers.get("x-ratelimit-remaining-tokens"))
     if limit is None or limit <= 0:
         return None
 
-    changed = limit != token_limiter.per_minute
-    token_limiter.per_minute = limit
+    effective = limit if CONFIGURED_TPM is None else min(limit, CONFIGURED_TPM)
+    changed = effective != token_limiter.per_minute
+    token_limiter.per_minute = effective
 
     day_limit = _parse_limit_header(headers.get("x-ratelimit-limit-tokens-day"))
     if day_limit and day_limit > 0:
-        token_limiter.per_day = day_limit
+        token_limiter.per_day = day_limit if CONFIGURED_TPD is None else min(day_limit, CONFIGURED_TPD)
 
     return {
-        "limit_per_minute": limit,
+        "limit_per_minute": effective,
+        "provider_reported": limit,
+        "configured_ceiling": CONFIGURED_TPM,
+        "capped_by_config": CONFIGURED_TPM is not None and limit > CONFIGURED_TPM,
         "provider_remaining": remaining,
         "adopted": changed,
+    }
+
+
+def adopt_limit_from_rate_limit_error(model: str, detail: str) -> dict | None:
+    """Learn the real ceiling from a 429's own words.
+
+    Groq states the arithmetic in the error body:
+
+        Rate limit reached for model `meta-llama/llama-4-scout-17b-16e-instruct`
+        ... on tokens per minute (TPM): Limit 30000, Used 18391, Requested 13761
+
+    That is more trustworthy than the response headers in exactly the case that
+    matters, because it names the model that actually ran and the limit that
+    actually bound. For a routing model the two differ, and the headers describe
+    the router.
+
+    `Requested` is the provider's own count of what this call cost, which is the
+    only way to calibrate an estimate for a model whose real prompt we never
+    see: an agentic model prepends tool schemas and internal instructions, so
+    the wire cost is a multiple of the text we sent. Without this the estimate
+    can never improve, because the request never succeeds and a failed call
+    reports no usage.
+    """
+    if not detail:
+        return None
+
+    found = {
+        key: int(value)
+        for key, value in re.findall(r"\b(Limit|Used|Requested)\s+(\d+)", detail)
+    }
+    if not found:
+        return None
+
+    named = re.search(r"for model `([^`]+)`", detail)
+    routed_to = named.group(1) if named else None
+
+    limit = found.get("Limit")
+    if limit and limit > 0:
+        # The binding limit, capped by any explicit configuration as above.
+        effective = limit if CONFIGURED_TPM is None else min(limit, CONFIGURED_TPM)
+        token_limiter.per_minute = effective
+
+    return {
+        "limit": limit,
+        "used": found.get("Used"),
+        "requested": found.get("Requested"),
+        "routed_to": routed_to,
+        "applies_to": model,
     }
 
 

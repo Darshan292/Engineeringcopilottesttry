@@ -131,8 +131,11 @@ def test_estimator_never_returns_zero_for_content():
 
 
 def test_unknown_models_fall_back_to_a_small_window():
-    window, source = context_window_for("qwen/qwen3.6-27b")
-    assert window == 131_072 and source == "static-table"
+    # 131,042 rather than a round 131,072: that is the figure Groq's own
+    # /models reports for this one, and the table records what the provider
+    # says rather than what looks tidy.
+    window, source = context_window_for("qwen/qwen3.8-27b")
+    assert window == 131_042 and source == "static-table"
 
     window, source = context_window_for("something-nobody-has-heard-of")
     assert window == 8_192
@@ -140,8 +143,8 @@ def test_unknown_models_fall_back_to_a_small_window():
 
 
 def test_provider_prefixed_model_names_still_resolve():
-    window, source = context_window_for("groq/qwen/qwen3.6-27b")
-    assert window == 131_072
+    window, source = context_window_for("groq/qwen/qwen3.8-27b")
+    assert window == 131_042
     assert "suffix" in source
 
 
@@ -155,11 +158,11 @@ def test_provider_metadata_overrides_the_static_table(monkeypatch):
     # Provider disagrees with our hardcoded 131072, and a model we never listed.
     fresh.update(
         [
-            {"id": "qwen/qwen3.6-27b", "context_window": 98_304},
+            {"id": "qwen/qwen3.8-27b", "context_window": 98_304},
             {"id": "brand-new-model", "context_window": 262_144},
         ]
     )
-    assert context_window_for("qwen/qwen3.6-27b") == (98_304, "provider")
+    assert context_window_for("qwen/qwen3.8-27b") == (98_304, "provider")
     assert context_window_for("brand-new-model") == (262_144, "provider")
 
 
@@ -222,7 +225,7 @@ def test_calibration_ignores_wild_outliers():
 
 
 def test_budget_reserves_output_system_and_margin():
-    budget = build_budget("qwen/qwen3.6-27b", "system " * 500, 4096)
+    budget = build_budget("qwen/qwen3.8-27b", "system " * 500, 4096)
     assert budget.available_for_input < budget.context_window
     assert budget.reserved_for_output == 4096
     assert budget.reserved_for_system > 0
@@ -333,14 +336,14 @@ def _big_log(lines: int) -> str:
 
 def test_small_input_is_sent_whole():
     ir = parse_logs(SAMPLES["log-rca"]["content"])
-    plan = plan_context(ir, build_budget("qwen/qwen3.6-27b", "sys", 4096))
+    plan = plan_context(ir, build_budget("qwen/qwen3.8-27b", "sys", 4096))
     assert plan.strategy == "full"
     assert len(plan.chunks) == 1
 
 
 def test_large_input_is_compressed_rather_than_truncated():
     ir = parse_logs(_big_log(40_000))
-    plan = plan_context(ir, build_budget("qwen/qwen3.6-27b", "sys", 4096))
+    plan = plan_context(ir, build_budget("qwen/qwen3.8-27b", "sys", 4096))
     assert plan.strategy == "summary"
     assert plan.estimated_input_tokens <= plan.budget.available_for_input
     # Compression must preserve the fact that 40k lines existed.
@@ -421,7 +424,7 @@ def test_full_coverage_is_preferred_over_a_cheaper_lossy_plan():
     """
     ir = parse_logs(_varied_log(600))
     plan = plan_context(
-        ir, build_budget("qwen/qwen3.6-27b", "sys", 2_200, token_allowance_per_minute=8_000)
+        ir, build_budget("qwen/qwen3.8-27b", "sys", 2_200, token_allowance_per_minute=8_000)
     )
     assert plan.strategy == "map_reduce", (
         f"a 600-line log that fits in {len(plan.chunks)} parts was reduced instead of read"
@@ -437,7 +440,7 @@ def test_selection_is_the_fallback_when_full_coverage_is_unaffordable():
     """Degrade with the arithmetic shown, rather than refuse outright."""
     ir = parse_logs(_varied_log(20_000))
     plan = plan_context(
-        ir, build_budget("qwen/qwen3.6-27b", "sys", 2_200, token_allowance_per_minute=8_000)
+        ir, build_budget("qwen/qwen3.8-27b", "sys", 2_200, token_allowance_per_minute=8_000)
     )
     assert plan.strategy == "selected"
     assert plan.estimated_calls == 1
@@ -460,7 +463,7 @@ def test_a_uniform_huge_log_resolves_to_one_call_inside_the_budget():
     """
     ir = parse_logs(_big_log(60_000))
     plan = plan_context(
-        ir, build_budget("qwen/qwen3.6-27b", "sys", 1024, token_allowance_per_minute=8000)
+        ir, build_budget("qwen/qwen3.8-27b", "sys", 1024, token_allowance_per_minute=8000)
     )
     assert plan.strategy in {"summary", "selected"}
     assert plan.estimated_calls == 1
@@ -472,7 +475,7 @@ def test_a_uniform_huge_log_resolves_to_one_call_inside_the_budget():
 def test_the_plan_is_explained_in_plain_language():
     """The caller is entitled to know their input was reduced and by what rule."""
     ir = parse_logs(_big_log(40_000))
-    plan = plan_context(ir, build_budget("qwen/qwen3.6-27b", "sys", 1024, token_allowance_per_minute=8000))
+    plan = plan_context(ir, build_budget("qwen/qwen3.8-27b", "sys", 1024, token_allowance_per_minute=8000))
     description = plan.describe()
     assert "PROCESSING PLAN" in description
     assert "Budget:" in description
@@ -483,9 +486,9 @@ def test_the_budget_is_capped_by_the_token_allowance():
     """A 131k context window on an 8k/min account is not a 131k budget."""
     from backend.prompts import TOOL_PROMPTS
 
-    generous = build_budget("qwen/qwen3.6-27b", TOOL_PROMPTS["log-rca"], 4096)
+    generous = build_budget("qwen/qwen3.8-27b", TOOL_PROMPTS["log-rca"], 4096)
     limited = build_budget(
-        "qwen/qwen3.6-27b", TOOL_PROMPTS["log-rca"], 4096, token_allowance_per_minute=8000
+        "qwen/qwen3.8-27b", TOOL_PROMPTS["log-rca"], 4096, token_allowance_per_minute=8000
     )
     assert generous.effective_window == generous.context_window
     assert limited.effective_window == 8000

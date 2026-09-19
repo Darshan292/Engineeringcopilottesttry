@@ -33,21 +33,20 @@ def _log(lines: int) -> str:
 
 
 @pytest.fixture
-def tiny_window(monkeypatch):
+def tiny_window(monkeypatch, shrink_window):
     """Force map-reduce by shrinking the context window.
 
     Big enough that the system prompt and output reserve still leave room for
     content -- otherwise the planner correctly refuses before chunking, which
     is a different code path.
     """
-    from backend.core import tokens
-
     # 16,000 used to force chunking; right-sizing the per-tool output reserve
     # freed enough budget that a compressed single call now fits, which is the
     # better outcome but a different code path. 10,000 still forces the split.
-    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 10_000)
-    monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
-    return None
+    #
+    # Returns the model it shrank, so a test building its own budget uses the
+    # same one the app does rather than naming a model literally.
+    return shrink_window(10_000)
 
 
 # --- the planner and the executor must agree ------------------------------
@@ -57,8 +56,9 @@ def test_planner_produces_multiple_chunks_for_a_large_input(tiny_window):
     from backend.prompts import TOOL_PROMPTS
 
     ir = parse_logs(_log(600))
-    # The real system prompt, so the budget matches what the pipeline computes.
-    plan = plan_context(ir, build_budget("qwen/qwen3.6-27b", TOOL_PROMPTS["log-rca"], 4096))
+    # The real system prompt and the model the app is configured with, so the
+    # budget matches what the pipeline computes.
+    plan = plan_context(ir, build_budget(tiny_window, TOOL_PROMPTS["log-rca"], 4096))
     assert plan.strategy == "map_reduce"
     assert len(plan.chunks) > 1
     # Every chunk must be individually sendable.

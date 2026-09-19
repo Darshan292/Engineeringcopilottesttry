@@ -36,8 +36,10 @@ from ..core.redaction import (
     fail_closed,
     redact,
 )
+from ..config import is_routing_model
 from ..core.tokens import (
     MIN_USABLE_CONTEXT,
+    ROUTING_MODEL_PRIOR,
     build_budget,
     estimate_tokens,
     non_chat_reason,
@@ -268,15 +270,37 @@ async def _plan_and_budget(
         )
 
     if budget.available_for_input <= 0:
+        # Name the limit that actually bound. Blaming a 131,072-token context
+        # window when the real constraint was an 8,000-token minute sent people
+        # looking for a bigger model, which would not have helped at all.
+        window_bound = budget.effective_window >= budget.context_window
+        constraint = (
+            f"'{chosen}' has a {budget.context_window:,}-token context window"
+            if window_bound
+            else (
+                f"a {token_limiter.per_minute:,}-token-per-minute allowance caps each call at "
+                f"{budget.effective_window:,} tokens (the model's context window is "
+                f"{budget.context_window:,} and is not the constraint here)"
+            )
+        )
+        routing_note = ""
+        remedy = (
+            f"Use a model with a larger window: {', '.join(suggested_models())}."
+            if window_bound
+            else f"Raise TOKEN_LIMIT_PER_MINUTE above {budget.reserved_for_system + budget.reserved_for_output + budget.safety_margin:,}."
+        )
+        if is_routing_model(chosen):
+            routing_note = (
+                f" '{chosen}' is a routing model, so the instruction reserve is inflated by about "
+                f"{ROUTING_MODEL_PRIOR:g}x to cover the tool schemas it sends on your behalf; a "
+                f"plain chat model such as {suggested_models()[0]} needs far less."
+            )
         raise GroqError(
-            f"'{chosen}' has a {budget.context_window:,}-token window, and this request reserves "
-            f"{budget.reserved_for_output:,} for the reply plus {budget.reserved_for_system:,} for "
-            f"instructions, leaving nothing for your input.",
+            f"No budget left for your input: {constraint}, and this request reserves "
+            f"{budget.reserved_for_output:,} for the reply, {budget.reserved_for_system:,} for "
+            f"instructions and {budget.safety_margin:,} as margin.",
             status=422,
-            hint=(
-                f"Either lower GROQ_MAX_TOKENS (currently {budget.reserved_for_output:,}) or use a "
-                f"model with a larger window: {', '.join(suggested_models())}."
-            ),
+            hint=f"{remedy}{routing_note}",
         )
 
     if budget.window_source.startswith("conservative"):
@@ -285,6 +309,32 @@ async def _plan_and_budget(
             f"deployment and could not be read from the provider, so a conservative "
             f"{budget.context_window:,}-token window was assumed. Large inputs may be "
             f"compressed or refused more aggressively than necessary."
+        )
+
+    # Splitting is the answer to "this input is bigger than one call". It is
+    # not the answer to "one call is bigger than one minute's allowance", and
+    # conflating the two wastes a lot of somebody's quota: every part re-sends
+    # the system prompt and re-reserves the output, so N parts cost N times the
+    # fixed overhead. When that overhead already dominates, more parts is
+    # strictly worse than fewer, and the only real fixes are a cheaper model or
+    # a higher allowance.
+    fixed = budget.reserved_for_system + budget.reserved_for_output + budget.safety_margin
+    per_call = fixed + budget.available_for_input
+    if per_call > 0 and budget.available_for_input < per_call * 0.25:
+        routing_note = ""
+        if is_routing_model(chosen):
+            routing_note = (
+                f" '{chosen}' is a routing model: it sends its own instructions and tool "
+                f"schemas alongside your text, so one call costs roughly "
+                f"{ROUTING_MODEL_PRIOR:g}x what the visible input suggests. A plain chat "
+                f"model such as {suggested_models()[0]} does not carry that overhead."
+            )
+        warnings.append(
+            f"Only {budget.available_for_input:,} of the {per_call:,} tokens available per call "
+            f"can hold your input; the other {fixed:,} are the instructions, the reserved reply "
+            f"and the safety margin. Splitting a large input will not help here, because every "
+            f"part pays that {fixed:,} again.{routing_note} Raise TOKEN_LIMIT_PER_MINUTE if your "
+            f"account allows, or switch GROQ_MODEL."
         )
 
     # Parsing and planning are CPU-bound and run on multi-megabyte inputs.
@@ -339,7 +389,16 @@ async def _run(
     map_reserve = plan.map_output_tokens or decided.map_reserve
 
     if plan.strategy == "reject":
-        raise GroqError(plan.reason, status=413, hint="See the reason above for the available options.")
+        # Carry the budget warnings into the hint. A refusal discards `warnings`
+        # along with the rest of the response, which threw away the one line
+        # that explained *why* only 52 tokens per call were left -- leaving a
+        # message that said "raise the limit" without saying what was eating it.
+        diagnosis = " ".join(w for w in warnings if "tokens available per call" in w)
+        raise GroqError(
+            plan.reason,
+            status=413,
+            hint=(diagnosis or "See the reason above for the available options."),
+        )
 
     if plan.strategy != "full":
         warnings.append(plan.reason)

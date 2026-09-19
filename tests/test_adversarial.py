@@ -272,12 +272,11 @@ def test_input_beyond_the_absolute_backstop_is_rejected_clearly(client):
     assert "limit" in res.json()["error"].lower()
 
 
-def test_a_huge_log_on_a_tiny_budget_is_selected_not_refused(client, for_tool, monkeypatch):
+def test_a_huge_log_on_a_tiny_budget_is_selected_not_refused(client, for_tool, monkeypatch, shrink_window):
     """Relevance selection handles what used to need chunking or a refusal."""
     from backend.core import tokens
 
-    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 8_000)
-    monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
+    shrink_window(8_000)
     stub = for_tool("log-rca")
 
     res = client.post("/api/log-rca", json={"input": _repetitive_log(20_000)})
@@ -296,14 +295,13 @@ def test_a_huge_log_on_a_tiny_budget_is_selected_not_refused(client, for_tool, m
     assert body["diagnostics"]["confidence"]["computed_score"] < 0.9
 
 
-def test_a_plan_that_would_take_too_long_is_refused_with_the_arithmetic(client, for_tool, monkeypatch):
+def test_a_plan_that_would_take_too_long_is_refused_with_the_arithmetic(client, for_tool, monkeypatch, shrink_window):
     """Minutes of waiting on a token allowance is better refused up front."""
     from backend.core import chunking, tokens
 
     from backend import governance
 
-    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "qwen/qwen3.6-27b", 8_000)
-    monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
+    shrink_window(8_000)
     monkeypatch.setattr(chunking, "MAX_PLAN_SECONDS", 5)
     # The suite runs with an effectively unlimited allowance so pacing never
     # interferes; this test is specifically about pacing, so it needs a real

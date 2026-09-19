@@ -226,7 +226,7 @@ async def call_structured(
     last_raw = ""
     used_model = model or ""
 
-    from ..governance import await_token_budget, token_limiter
+    from ..governance import MAX_TOTAL_WAIT_SECONDS, await_token_budget, token_limiter
 
     for attempt in range(1, MAX_REPAIR_ATTEMPTS + 2):
         # Check the token budget before each attempt, including repairs. A
@@ -261,8 +261,27 @@ async def call_structured(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 json_mode=True,
+                # Share one waiting budget across local pacing and provider
+                # back-off. Two independent budgets would let a request wait
+                # twice as long as anyone agreed to.
+                max_wait_seconds=max(0.0, MAX_TOTAL_WAIT_SECONDS - trace.waited_seconds),
             )
             trace.upstream_calls += 1
+            # Time the provider held us back counts against the same budget as
+            # time our own limiter held us back; both are waiting, and the user
+            # is owed one honest number for it.
+            provider_wait = float(result.get("rate_limited_seconds") or 0.0)
+            if provider_wait:
+                trace.waited_seconds += provider_wait
+                trace.record(
+                    f"{stage_name}.provider_backoff{attempt}",
+                    time.perf_counter() - provider_wait,
+                    {
+                        "waited_seconds": provider_wait,
+                        "retries": result.get("rate_limit_retries"),
+                        "reason": "provider rate limit",
+                    },
+                )
             # The pacer reserved `projected`; replace it with what the call
             # actually cost. Settling both ways matters: charging the excess
             # when the estimate was low keeps the limiter honest, and releasing

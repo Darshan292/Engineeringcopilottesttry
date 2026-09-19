@@ -230,6 +230,28 @@ def patch_settings(monkeypatch):
     return _apply
 
 
+@pytest.fixture
+def shrink_window(monkeypatch):
+    """Force a small context window for whichever model the app is configured to use.
+
+    Tests used to name the model literally. That quietly disabled every one of
+    them the day the default changed: the fixture shrank a window nobody was
+    using, everything fit in one call, and five map-reduce tests passed while
+    exercising the single-call path instead.
+    """
+    from backend.config import settings as live_settings
+    from backend.core import tokens
+
+    def apply(window: int, model: str | None = None) -> str:
+        target = model or live_settings.groq_model
+        monkeypatch.setitem(tokens.CONTEXT_WINDOWS, target, window)
+        # A cached provider window would override the table.
+        monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
+        return target
+
+    return apply
+
+
 @pytest.fixture(autouse=True)
 def no_network_metadata_refresh(monkeypatch):
     """Keep the model-metadata refresh off the network.

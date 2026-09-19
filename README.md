@@ -37,19 +37,73 @@ all MIT/BSD/Apache-2.0.
 
 ---
 
+## Rate limits are a delay, not a failure
+
+A free-tier allowance is small enough that a normal request hits it. The
+application treats that as pacing, not as an error:
+
+- **Before the call**, the local limiter holds the request until the minute has
+  room. It refuses upfront only when a single call could never fit, and then it
+  says so with the arithmetic instead of letting you retry into a wall.
+- **After the call**, a `429` is read for the delay the provider states
+  (`retry-after`, `x-ratelimit-reset-tokens`, or the "try again in 4.3s" in the
+  message body), waited out, and retried. Up to six times, sharing one
+  `MAX_TOTAL_WAIT_SECONDS` budget with the local pacing so a request never waits
+  longer in total than you allowed.
+- **A configured limit is a ceiling.** `TOKEN_LIMIT_PER_MINUTE=8000` stays 8,000
+  even when the provider's headers advertise 70,000. Discovery may lower the
+  budget; it does not overrule your decision.
+- **The 429 is also the best information available.** Its body names the limit
+  that actually bound, the model that actually ran, and what the provider
+  counted this call as costing. All three are adopted.
+
+### Splitting solves size, not rate limits
+
+Worth being explicit, because it is easy to assume otherwise: map-reduce exists
+for input that is **larger than one call**. It does not make a small allowance
+go further — it does the opposite. Every part re-sends the system prompt and
+re-reserves the output, so N parts cost roughly N times that fixed overhead.
+
+If the per-call overhead already dominates your allowance, the app says so in a
+warning rather than splitting into something slower *and* more expensive. The
+fixes there are a larger allowance or a cheaper model, and the warning names
+both.
+
+### Routing models cost about twice what they look like
+
+`groq/compound` and `groq/compound-mini` are agents in front of other models.
+Three consequences, all of which this app now handles explicitly:
+
+- The rate limit that binds is the **underlying** model's, so a 429 names a
+  model you never chose (`meta-llama/llama-4-scout-...`). The error says so.
+- The prompt on the wire carries tool schemas and internal instructions you
+  never wrote, so one call costs roughly **2.3x** the visible input. These
+  models start with that correction already applied, rather than discovering it
+  by failing.
+- On a small allowance the fixed overhead can exceed the whole minute. At
+  `TOKEN_LIMIT_PER_MINUTE=8000`, `groq/compound` leaves about **512 tokens** for
+  your input; `openai/gpt-oss-120b` leaves about **2,450**. If you are pacing
+  tightly, use a plain chat model.
+
+---
+
 ## Read this before setting `GROQ_MODEL`
 
-The conventional default `llama-3.3-70b-versatile` **no longer works**. Groq
-deprecated it on 2026-06-17 and decommissioned it on 2026-08-16; requests now
-return `404 model_not_found`.
+Groq's catalogue turns over fast. `llama-3.3-70b-versatile` was decommissioned
+on 2026-08-16, and `qwen/qwen3.6-27b` — the replacement this app defaulted to
+after that — has since been superseded by `qwen/qwen3.8-27b`. Both now return
+`404 model_not_found` and the error names the current replacement.
 
-The default here is **`qwen/qwen3.6-27b`**, Groq's own recommended replacement.
+The default here is **`openai/gpt-oss-120b`**: of the free-tier chat models it
+is the most reliable at following a JSON schema, which is the thing this
+application asks of it on every call.
 
 | Model | Notes |
 | --- | --- |
-| `qwen/qwen3.6-27b` | **Default.** ~131K context, free tier. |
-| `openai/gpt-oss-120b` | Larger. Follows JSON schemas more reliably — worth switching to if you see repair attempts. |
+| `openai/gpt-oss-120b` | **Default.** ~131K context. Most reliable at structured output. |
 | `openai/gpt-oss-20b` | Smaller and faster. |
+| `qwen/qwen3.8-27b` | ~131K context, free tier. |
+| `groq/compound`, `groq/compound-mini` | Agentic routers. Usable, but see the section above — one call costs about 2.3x the visible input, and the rate limit that binds is the underlying model's. |
 
 Model IDs churn, so the app never trusts a baked-in list. `GET /api/models`
 returns the live list for your key, and pointing `GROQ_MODEL` at a model known
@@ -176,7 +230,8 @@ All optional, all defaulting to sensible local-use values.
 | Control | Default | Variable |
 | --- | --- | --- |
 | Request limit | 20/min, 500/day, shed locally | `RATE_LIMIT_PER_MINUTE`, `RATE_LIMIT_PER_DAY` |
-| **Token budget** | 8k/min, 200k/day; adopted from provider headers | `TOKEN_LIMIT_PER_MINUTE`, `TOKEN_LIMIT_PER_DAY` |
+| **Token budget** | 8k/min, 200k/day. A value you set is a **ceiling**: provider headers may lower it, never raise it | `TOKEN_LIMIT_PER_MINUTE`, `TOKEN_LIMIT_PER_DAY` |
+| Provider back-off | a 429 is waited out and retried, up to 6 times, using the delay the provider states | shares `MAX_TOTAL_WAIT_SECONDS` |
 | Concurrency | 4 simultaneous upstream calls | `MAX_CONCURRENT_REQUESTS` |
 | Pacing | wait for token budget rather than refuse | `WAIT_FOR_TOKEN_BUDGET` |
 | Max wait, one request | 600s total spent waiting on the allowance | `MAX_TOTAL_WAIT_SECONDS` |
@@ -236,7 +291,7 @@ Errors carry a remediation, not just a status code:
 ```json
 {
   "error": "Model 'llama-3.3-70b-versatile' is unavailable: model_not_found",
-  "hint": "'llama-3.3-70b-versatile' is retired: Decommissioned on the Groq free/developer tier on 2026-08-16. Set GROQ_MODEL=qwen/qwen3.6-27b in .env and restart.",
+  "hint": "'llama-3.3-70b-versatile' is retired: Decommissioned on the Groq free/developer tier on 2026-08-16. Set GROQ_MODEL=openai/gpt-oss-120b in .env and restart.",
   "request_id": "4e295766e9f1"
 }
 ```
@@ -246,7 +301,7 @@ Errors carry a remediation, not just a status code:
 ## Tests
 
 ```bash
-.venv/bin/pytest                        # 256 tests, no network, no key, no cost
+.venv/bin/pytest                        # 270 tests, no network, no key, no cost
 node --test tests/markdown.test.mjs     # 22 renderer tests including XSS
 ```
 
@@ -264,6 +319,9 @@ tests could not see it:
 - `test_plan_preview.py` proves the plan shown before a run is the plan the run
   follows — including that the promised model-call count bounds the real one on
   a split input, which is where it was previously wrong by 2x.
+- `test_rate_limit_recovery.py` proves a 429 is waited out and retried rather
+  than surfaced, that a configured token limit is never raised by the provider,
+  and that the limit and real per-call cost stated in a 429 body are adopted.
 
 **These prove the system behaves correctly. They say nothing about whether the
 model's analysis is any good.** That needs a real model:

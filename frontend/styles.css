@@ -627,10 +627,12 @@ body {
  */
 
 .plan-panel {
+  flex: 0 0 auto;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-raised);
-  margin: 0 0 12px;
+  /* Aligned with the pane's own 20px gutters rather than bleeding to the edge. */
+  margin: 0 20px 12px;
   overflow: hidden;
 }
 
@@ -659,6 +661,13 @@ body {
 
 .plan-body {
   padding: 12px;
+  /* A 27-step plan is taller than the viewport. Without a ceiling the panel
+     grew to fit it, pushed the output below the fold, and the steps at the
+     bottom were simply unreachable -- the page scrollbar belongs to the output
+     pane, not to this panel. Scroll inside the panel instead. */
+  max-height: min(46vh, 520px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .plan-body[hidden] {
@@ -835,5 +844,14 @@ body {
   .pane-foot {
     padding-left: 14px;
     padding-right: 14px;
+  }
+
+  .plan-panel {
+    margin-left: 14px;
+    margin-right: 14px;
+  }
+
+  .plan-body {
+    max-height: 40vh;
   }
 }

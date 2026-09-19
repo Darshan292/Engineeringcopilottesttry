@@ -30,30 +30,43 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 # These are hints for humans and for the /api/models fallback only; the app
 # never hard-blocks a model name. Whatever GROQ_MODEL says is what gets sent.
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = "qwen/qwen3.6-27b"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 KNOWN_FREE_TIER_MODELS: tuple[dict[str, str], ...] = (
     {
-        "id": "qwen/qwen3.6-27b",
-        "note": "Default. Groq's recommended replacement for llama-3.3-70b-versatile. ~131K context.",
-    },
-    {
         "id": "openai/gpt-oss-120b",
-        "note": "Larger open-weight MoE, also on the free tier. ~131K context, bigger output budget.",
+        "note": "Default. ~131K context and the most reliable of these at following a JSON schema.",
     },
     {
         "id": "openai/gpt-oss-20b",
         "note": "Smaller and faster sibling. Good when you want snappier turnaround.",
+    },
+    {
+        "id": "qwen/qwen3.8-27b",
+        "note": "Alibaba's open-weight model on the free tier. ~131K context.",
     },
 )
 
 RETIRED_MODELS: dict[str, str] = {
     "llama-3.3-70b-versatile": "Decommissioned on the Groq free/developer tier on 2026-08-16.",
     "llama-3.1-8b-instant": "Deprecated alongside llama-3.3-70b-versatile on 2026-06-17.",
+    "qwen/qwen3.6-27b": "Superseded by qwen/qwen3.8-27b and no longer served.",
     "mixtral-8x7b-32768": "Long retired.",
     "llama3-70b-8192": "Long retired.",
     "llama3-8b-8192": "Long retired.",
 }
+
+# Models that are a router or an agent in front of other models rather than a
+# model themselves. They matter for budgeting: the rate limit that binds is the
+# underlying model's, the 429 names a model the caller never chose, and the
+# prompt on the wire carries tool schemas and internal instructions that the
+# text we sent gives no hint of -- so a token estimate built from our own
+# messages understates the real cost, on Groq's compound models by roughly 2x.
+ROUTING_MODELS: frozenset[str] = frozenset({"groq/compound", "groq/compound-mini"})
+
+
+def is_routing_model(model: str) -> bool:
+    return (model or "").strip().lower() in ROUTING_MODELS
 
 
 def _env_float(name: str, default: float) -> float:
