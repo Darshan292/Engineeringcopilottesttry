@@ -337,7 +337,7 @@ def test_a_non_chat_model_is_refused_by_name(client, for_tool, patch_settings):
     body = res.json()
     assert "classifier" in body["error"]
     assert "chat model" in body["error"]
-    assert "GROQ_MODEL" in body["hint"]
+    assert "LLM_MODEL" in body["hint"]
 
 
 def test_a_too_small_context_window_is_refused_by_name(client, for_tool, patch_settings, monkeypatch):

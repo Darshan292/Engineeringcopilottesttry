@@ -76,15 +76,70 @@ async def health():
     }
 
 
+async def _announce_billing_posture(provider) -> None:
+    """Load the provider's price list and say plainly what may be spent."""
+    from .billing import free_tier_only, guard
+    from .groq_client import list_models
+
+    if not free_tier_only():
+        log.warning(
+            "  billing: FREE_TIER_ONLY is off -- paid models may be called and CHARGED."
+        )
+    else:
+        log.info("  billing: free models only; anything with a non-zero price is refused")
+
+    if not settings.has_api_key:
+        return
+
+    try:
+        await list_models()  # populates the guard as a side effect
+    except Exception as exc:
+        log.warning("  billing: could not read %s's price list (%s).", provider.label, exc)
+        if free_tier_only():
+            log.warning(
+                "  billing: calls are BLOCKED until it can be read, because no model can be "
+                "confirmed free. This is deliberate."
+            )
+        return
+
+    free = guard.free_models()
+    log.info("  billing: %d free model(s) available to this key", len(free))
+
+    configured = (settings.groq_model or "").strip()
+    if not configured:
+        return
+    try:
+        guard.assert_free(configured)
+    except Exception as exc:
+        log.warning("  billing: '%s' is NOT callable -- %s", configured, exc)
+        if free:
+            log.warning("  billing: free alternatives include %s", ", ".join(free[:5]))
+    else:
+        log.info("  billing: '%s' is confirmed free", configured)
+
+
 @app.on_event("startup")
 async def announce() -> None:
+    from .providers import api_key_env_name, detect_provider
+
+    provider = detect_provider(settings.groq_base_url)
     log.info("Engineering Copilot starting")
-    log.info("  model: %s", settings.groq_model)
+    log.info("  provider: %s (%s)", provider.label, settings.groq_base_url)
+    log.info("  model: %s", settings.groq_model or "(not set)")
     if not settings.has_api_key:
-        log.warning("  GROQ_API_KEY is NOT set -- every tool call will fail with 503.")
-        log.warning("  Fix: cp .env.example .env, then paste a key from https://console.groq.com/keys")
+        key_name = api_key_env_name(provider)
+        log.warning("  %s is NOT set -- every tool call will fail with 503.", key_name)
+        log.warning(
+            "  Fix: cp .env.example .env, then paste a key from %s",
+            provider.console_keys_url or "your provider's console",
+        )
     if settings.model_warning:
         log.warning("  %s", settings.model_warning)
+
+    # Read the price list before serving anything. The guard refuses every call
+    # until this succeeds, so doing it now turns "the first request failed with
+    # a confusing 503" into a line in the startup log that says what to fix.
+    await _announce_billing_posture(provider)
 
     for warning in deployment_warnings(settings.host):
         log.warning("  SECURITY: %s", warning)

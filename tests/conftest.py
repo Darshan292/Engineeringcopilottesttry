@@ -279,8 +279,25 @@ def reset_process_state():
     the computed budget, which changes whether an input chunks or compresses.
     Without this, a test's result depended on which tests ran before it.
     """
+    from backend.billing import FreeTierGuard
     from backend.core.tokens import calibrator, registry
     from backend.governance import limiter, token_limiter
+
+    # The billing guard refuses every call until it has read a price list, and
+    # latches permanently once a charge is seen. Both are correct in production
+    # and would make the suite order-dependent, so each test starts from a fresh
+    # guard holding a catalogue shaped like the default provider's: models with
+    # no pricing block, as Groq publishes. That keeps the guard switched ON for
+    # every test -- a regression that refuses legitimate calls still fails here
+    # -- while `test_free_tier_guard.py` installs a priced catalogue of its own
+    # to exercise the strict path.
+    import backend.billing as billing_module
+    import backend.groq_client as groq_module
+
+    fresh_guard = FreeTierGuard()
+    fresh_guard.load_catalogue([{"id": "test-catalogue-placeholder"}])
+    billing_module.guard = fresh_guard
+    groq_module.guard = fresh_guard
 
     # The token budget defaults to the Groq free tier's 8,000/minute, which a
     # multi-call test legitimately exceeds. Tests get an effectively unlimited

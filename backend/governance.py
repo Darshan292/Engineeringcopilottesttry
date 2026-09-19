@@ -23,6 +23,8 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
+from .providers import detect_provider
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -174,8 +176,13 @@ class SlidingWindowLimiter:
         with self._lock:
             return len(self._day)
 
-    def check(self, client: str) -> tuple[bool, str, int]:
-        """Returns (allowed, reason, retry_after_seconds)."""
+    def check(self, client: str, *, record: bool = True) -> tuple[bool, str, int]:
+        """Returns (allowed, reason, retry_after_seconds).
+
+        `record=False` asks the question without charging for it, for the
+        HTTP-level gate: the provider counts upstream calls, not browser
+        clicks, so the calls themselves do the charging via `record()`.
+        """
         now = time.time()
         with self._lock:
             self._checks_since_sweep += 1
@@ -196,9 +203,40 @@ class SlidingWindowLimiter:
             if self.per_day and len(day) >= self.per_day:
                 return False, f"{self.per_day} requests/day", int(86_401 - (now - day[0]))
 
-            minute.append(now)
-            day.append(now)
+            if record:
+                minute.append(now)
+                day.append(now)
             return True, "", 0
+
+    def record(self, client: str, count: int = 1) -> None:
+        """Charge `count` requests without asking permission first.
+
+        One browser click is one HTTP request here and anything from one to
+        thirty upstream calls, and the provider counts the upstream ones. On a
+        token-rationed provider the difference is cosmetic. On a
+        request-rationed one -- OpenRouter's free tier allows fifty calls a day
+        -- it is the whole game: a single split input spent more than half the
+        day's allowance while this limiter recorded one, so the app believed it
+        had forty-nine left and the provider had already stopped answering.
+        """
+        if count <= 0:
+            return
+        now = time.time()
+        with self._lock:
+            for _ in range(count):
+                self._minute[client].append(now)
+                self._day[client].append(now)
+
+    def remaining(self, client: str) -> tuple[int, int]:
+        """(this minute, today). Large numbers where a limit is unset."""
+        now = time.time()
+        with self._lock:
+            minute = sum(1 for t in self._minute.get(client, ()) if now - t <= 60)
+            day = sum(1 for t in self._day.get(client, ()) if now - t <= 86_400)
+        return (
+            max(0, self.per_minute - minute) if self.per_minute else 1 << 30,
+            max(0, self.per_day - day) if self.per_day else 1 << 30,
+        )
 
     def snapshot(self, client: str) -> dict:
         now = time.time()
@@ -213,11 +251,17 @@ class SlidingWindowLimiter:
         }
 
 
-# Defaults sit just under the Groq free tier so the local limiter, not the
-# upstream 429, is what a caller hits first.
+# Defaults sit just under the active provider's free tier so the local limiter,
+# not the upstream 429, is what a caller hits first. They differ sharply:
+# Groq rations tokens and is relaxed about request count, while OpenRouter's
+# free tier rations requests -- 20 a minute and as few as 50 a day -- and states
+# no token ceiling at all. Compiling either one's numbers in as "the" defaults
+# means the wrong limiter binds and the useful one never fires.
+_PROVIDER = detect_provider()
+
 limiter = SlidingWindowLimiter(
-    per_minute=_env_int("RATE_LIMIT_PER_MINUTE", 20),
-    per_day=_env_int("RATE_LIMIT_PER_DAY", 500),
+    per_minute=_env_int("RATE_LIMIT_PER_MINUTE", _PROVIDER.default_requests_per_minute),
+    per_day=_env_int("RATE_LIMIT_PER_DAY", _PROVIDER.default_requests_per_day),
 )
 
 
@@ -378,12 +422,16 @@ class TokenBudgetLimiter:
 # What the operator explicitly asked for, or None when they left it to us.
 # Kept separate from the limiter's live value, which provider discovery may
 # lower, so "what was configured" survives being tuned down at runtime.
-CONFIGURED_TPM: int | None = _env_int("TOKEN_LIMIT_PER_MINUTE", 8_000) if _env_is_set("TOKEN_LIMIT_PER_MINUTE") else None
-CONFIGURED_TPD: int | None = _env_int("TOKEN_LIMIT_PER_DAY", 200_000) if _env_is_set("TOKEN_LIMIT_PER_DAY") else None
+CONFIGURED_TPM: int | None = _env_int("TOKEN_LIMIT_PER_MINUTE", 0) if _env_is_set("TOKEN_LIMIT_PER_MINUTE") else None
+CONFIGURED_TPD: int | None = _env_int("TOKEN_LIMIT_PER_DAY", 0) if _env_is_set("TOKEN_LIMIT_PER_DAY") else None
 
+# Zero means this provider does not ration tokens, and the budget then falls
+# back to the model's context window. Pretending otherwise on a request-limited
+# provider caps every call at a ceiling that does not exist, which is how a
+# 131,072-token model ends up reporting no room for input.
 token_limiter = TokenBudgetLimiter(
-    per_minute=_env_int("TOKEN_LIMIT_PER_MINUTE", 8_000),
-    per_day=_env_int("TOKEN_LIMIT_PER_DAY", 200_000),
+    per_minute=_env_int("TOKEN_LIMIT_PER_MINUTE", _PROVIDER.default_tokens_per_minute),
+    per_day=_env_int("TOKEN_LIMIT_PER_DAY", _PROVIDER.default_tokens_per_day),
 )
 
 # Waiting for budget beats failing. A free-tier ceiling means a multi-part
@@ -598,7 +646,13 @@ def concurrency_slot() -> asyncio.Semaphore:
 
 
 def enforce_rate_limit(client: str) -> None:
-    allowed, reason, retry_after = limiter.check(client)
+    """Gate an incoming HTTP request without charging the upstream budget.
+
+    The charge happens per upstream call, because that is what the provider
+    counts. Charging here as well would double-count the first call of every
+    request and, worse, understate everything after it.
+    """
+    allowed, reason, retry_after = limiter.check(client, record=False)
     if not allowed:
         raise GovernanceError(
             f"Rate limit exceeded: {reason}.",

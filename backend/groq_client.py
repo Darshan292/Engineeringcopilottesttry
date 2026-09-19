@@ -17,6 +17,8 @@ from typing import Any
 import httpx
 
 from .config import DEFAULT_MODEL, RETIRED_MODELS, settings
+from .billing import guard, price_check
+from .providers import api_key_env_name, detect_provider, seconds_until_reset
 
 log = logging.getLogger("copilot.groq")
 
@@ -83,17 +85,36 @@ def _auth_headers() -> dict[str, str]:
     return {
         "Authorization": f"Bearer {settings.groq_api_key}",
         "Content-Type": "application/json",
+        # Whatever this provider wants alongside the key. OpenRouter uses
+        # HTTP-Referer and X-Title for attribution; others ignore them.
+        **_provider().extra_headers,
     }
+
+
+def _provider():
+    """The active provider profile, derived from the configured base URL.
+
+    Resolved per call rather than captured at import, so a test or a reload that
+    repoints the endpoint is picked up instead of silently using the old rules.
+    """
+    return detect_provider(settings.groq_base_url)
 
 
 def _require_key() -> None:
     if not settings.has_api_key:
+        provider = _provider()
+        key_name = api_key_env_name(provider)
+        where = (
+            f"Create a free key at {provider.console_keys_url}, then "
+            if provider.console_keys_url
+            else ""
+        )
         raise GroqError(
-            "GROQ_API_KEY is not set, so there is nothing to authenticate with.",
+            f"{key_name} is not set, so there is nothing to authenticate with.",
             status=503,
             hint=(
-                "Create a free key at https://console.groq.com/keys, then "
-                "`cp .env.example .env`, paste the key into it, and restart the server."
+                f"{where}`cp .env.example .env`, paste the key into it, and restart "
+                f"the server."
             ),
         )
 
@@ -127,12 +148,12 @@ def _translate_http_error(response: httpx.Response, model: str) -> GroqError:
     if code == 404 or "model_not_found" in detail or "does not exist" in detail.lower():
         retired = RETIRED_MODELS.get(model)
         hint = (
-            f"'{model}' is retired: {retired} Set GROQ_MODEL={DEFAULT_MODEL} in .env and restart."
+            f"'{model}' is retired: {retired} Set LLM_MODEL={DEFAULT_MODEL} in .env and restart."
             if retired
             else (
-                f"Groq does not serve '{model}' on this account. "
+                f"{_provider().label} does not serve '{model}' on this account. "
                 f"Open GET /api/models to see what your key can actually call, "
-                f"then set GROQ_MODEL in .env."
+                f"then set LLM_MODEL in .env. {_provider().model_hint}"
             )
         )
         return GroqError(f"Model '{model}' is unavailable: {detail}", status=502, hint=hint)
@@ -153,7 +174,7 @@ def _translate_http_error(response: httpx.Response, model: str) -> GroqError:
             hint=(
                 f"This request waited for the allowance to roll and the limit was still "
                 f"reached.{routing_note} Lower TOKEN_LIMIT_PER_MINUTE so this app paces itself "
-                f"below the real ceiling, wait a minute, or switch GROQ_MODEL to a model with a "
+                f"below the real ceiling, wait a minute, or switch LLM_MODEL to a model with a "
                 f"separate bucket."
             ),
         )
@@ -232,15 +253,26 @@ def _routed_model(detail: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _retry_delay(response: httpx.Response, detail: str) -> float | None:
-    """How long the provider wants us to wait, from whichever source states it.
+def _retry_delay(response: httpx.Response, detail: str, attempt: int) -> float:
+    """How long to wait before trying again. Always answers.
 
-    Three sources, most authoritative first: the `retry-after` header, the
-    `x-ratelimit-reset-tokens` header, and the sentence in the error body
-    ("Please try again in 4.303999999s"). Groq populates the last one even when
-    it omits the first, and a fixed backoff instead of the stated figure either
-    wastes allowance or comes back too early.
+    Four sources, most authoritative first: the `retry-after` header, the
+    provider's reset header, the sentence in the error body ("Please try again
+    in 4.303999999s"), and finally a backoff derived from the provider profile.
+
+    That last fallback is the point. Returning "no idea" used to mean giving up,
+    which is fine for a provider that always states a delay and wrong for one
+    that does not: OpenRouter's free-tier per-minute 429 carries no Retry-After
+    at all, so silence would have reproduced exactly the bug this retry loop was
+    written to fix -- on a different provider.
+
+    The reset header is parsed through the provider profile because its units
+    are not agreed: Groq states a duration, OpenRouter an absolute Unix
+    millisecond timestamp. `seconds_until_reset` also sanity-checks the
+    magnitude, so mislabelling one as the other cannot produce an absurd sleep.
     """
+    provider = _provider()
+
     header = response.headers.get("retry-after")
     if header:
         try:
@@ -248,19 +280,22 @@ def _retry_delay(response: httpx.Response, detail: str) -> float | None:
         except ValueError:
             pass
 
-    reset = response.headers.get("x-ratelimit-reset-tokens")
-    if reset:
-        match = re.match(r"([\d.]+)\s*(ms|s|m)?", reset.strip())
-        if match:
-            value = float(match.group(1))
-            unit = match.group(2) or "s"
-            return {"ms": value / 1000, "s": value, "m": value * 60}[unit]
+    if provider.reset_header:
+        from_reset = seconds_until_reset(
+            response.headers.get(provider.reset_header),
+            absolute=provider.reset_is_absolute,
+        )
+        if from_reset is not None:
+            return from_reset
 
     match = re.search(r"try again in ([\d.]+)\s*(ms|s)?", detail or "", re.IGNORECASE)
     if match:
         value = float(match.group(1))
         return value / 1000 if match.group(2) == "ms" else value
-    return None
+
+    # Nothing stated. Back off geometrically from the profile's blind wait so a
+    # provider that never says anything still gets a few honest attempts.
+    return provider.blind_retry_seconds * (1.5 ** (attempt - 1))
 
 
 async def complete(
@@ -284,6 +319,18 @@ async def complete(
     _require_key()
 
     chosen_model = (model or settings.groq_model).strip()
+    if not chosen_model:
+        provider = _provider()
+        raise GroqError(
+            f"No model is configured, so there is nothing to send the request to.",
+            status=503,
+            hint=(
+                f"Set LLM_MODEL in your .env. {provider.label} ships no default here because "
+                f"its catalogue changes faster than any list compiled into this application. "
+                f"GET /api/models shows what your key can call right now; free models are "
+                f"flagged. {provider.model_hint}"
+            ),
+        )
     body: dict[str, Any] = {
         "model": chosen_model,
         "messages": [
@@ -296,6 +343,13 @@ async def complete(
     }
     if json_mode:
         body["response_format"] = {"type": "json_object"}
+
+    # Layer 1: nothing is callable until the provider's own price list has shown
+    # it to be free. Raised before the socket is opened, so a misconfiguration
+    # costs nothing at all.
+    guard.assert_free(chosen_model)
+    # Layer 2: ask the provider to enforce the same ceiling on its side.
+    body.update(guard.request_guard_fields(_provider().name))
 
     started = time.perf_counter()
     rate_limit_waits = 0.0
@@ -319,7 +373,7 @@ async def complete(
             raise GroqError(
                 f"Could not reach Groq: {exc}",
                 status=502,
-                hint="Check your network connection and that GROQ_BASE_URL is correct.",
+                hint="Check your network connection and that LLM_BASE_URL is correct.",
             ) from exc
 
     # A rate limit is a "come back shortly", not a refusal. The provider states
@@ -350,9 +404,9 @@ async def complete(
         detail = _extract_api_error(response)
         _learn_from_rate_limit(chosen_model, detail, body, max_tokens)
 
-        delay = _retry_delay(response, detail)
-        if delay is None or rate_limit_retries >= MAX_RATE_LIMIT_RETRIES:
+        if rate_limit_retries >= MAX_RATE_LIMIT_RETRIES:
             break
+        delay = _retry_delay(response, detail, rate_limit_retries + 1)
         # A provider asking for longer than one window is describing exhausted
         # quota, not a burst; waiting it out would hang the request for minutes
         # with nothing to show.
@@ -388,7 +442,7 @@ async def complete(
         raise GroqError(
             f"Groq returned a response this app could not parse: {exc}",
             status=502,
-            hint="This usually means the endpoint is not OpenAI-compatible. Check GROQ_BASE_URL.",
+            hint="This usually means the endpoint is not OpenAI-compatible. Check LLM_BASE_URL.",
         ) from exc
 
     if not text.strip():
@@ -402,6 +456,12 @@ async def complete(
         )
 
     usage = payload.get("usage") or {}
+
+    # Layer 3: believe the invoice over every assumption that preceded it. A
+    # non-zero figure here means the price list and the provider-side ceiling
+    # were both wrong, which is the case no amount of pre-flight checking can
+    # rule out -- so it latches and the next call is refused.
+    charged = guard.observe_usage(chosen_model, usage)
 
     # Close the calibration loop: compare what we estimated for this exact
     # payload against what the server actually charged, so future budgets for
@@ -434,7 +494,34 @@ async def complete(
         # a slow request is explicable instead of mysterious.
         "rate_limited_seconds": round(rate_limit_waits, 2),
         "rate_limit_retries": rate_limit_retries,
+        # Zero on a free model, and surfaced rather than dropped so "this cost
+        # nothing" is something the caller can see rather than take on trust.
+        "cost": charged,
     }
+
+
+def _context_length_of(model: dict) -> int | None:
+    """The model's context window, under whichever name this provider uses.
+
+    Groq says `context_window`, OpenRouter says `context_length` and also
+    repeats it under `top_provider`. Accepting all of them costs three lines and
+    removes a whole class of "why does every model show an unknown window".
+    """
+    for key in ("context_window", "context_length", "max_context_length"):
+        value = model.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    nested = model.get("top_provider")
+    if isinstance(nested, dict):
+        value = nested.get("context_length")
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
+def _vendor_of(model_id: str) -> str | None:
+    """'deepseek' from 'deepseek/deepseek-chat:free'."""
+    return model_id.split("/", 1)[0] if "/" in model_id else None
 
 
 async def list_models() -> list[dict[str, Any]]:
@@ -450,7 +537,7 @@ async def list_models() -> list[dict[str, Any]]:
                 f"{settings.groq_base_url}/models", headers=_auth_headers()
             )
     except httpx.HTTPError as exc:
-        raise GroqError(f"Could not reach Groq: {exc}", status=502) from exc
+        raise GroqError(f"Could not reach {_provider().label}: {exc}", status=502) from exc
 
     if response.status_code >= 400:
         raise _translate_http_error(response, settings.groq_model)
@@ -458,25 +545,39 @@ async def list_models() -> list[dict[str, Any]]:
     try:
         data = response.json().get("data", [])
     except ValueError as exc:
-        raise GroqError("Groq's model list was not valid JSON.", status=502) from exc
+        raise GroqError(f"{_provider().label}'s model list was not valid JSON.", status=502) from exc
 
     from .core.tokens import MIN_USABLE_CONTEXT, non_chat_reason
+
+    # The raw catalogue is the price list, so the billing guard is fed from it
+    # here -- the one place it is fetched. Every model's verdict is recorded
+    # before any of it is reshaped for the UI, so what the guard enforces and
+    # what the list displays cannot drift apart.
+    guard.load_catalogue(data)
 
     models = []
     for m in data:
         model_id = m.get("id")
         if not model_id:
             continue
-        window = m.get("context_window")
+        window = _context_length_of(m)
         reason = non_chat_reason(str(model_id))
         if reason is None and isinstance(window, int) and 0 < window < MIN_USABLE_CONTEXT:
             reason = f"context window of {window:,} tokens is too small for this application"
         models.append(
             {
                 "id": model_id,
-                "owned_by": m.get("owned_by"),
+                "owned_by": m.get("owned_by") or _vendor_of(str(model_id)),
                 "context_window": window,
                 "active": m.get("active", True),
+                # Marked rather than filtered: knowing a model is free is the
+                # first thing anyone on a free tier needs, and the provider is
+                # the only one who knows it.
+                # The guard's verdict, not a second opinion. A label that can
+                # disagree with what the app will actually allow is worse than
+                # no label: it tells you a model is free right up until the
+                # call is refused for costing money.
+                "free": price_check(m)[0],
                 # The provider lists every model the key can call, including
                 # classifiers and speech models. Selecting one of those fails
                 # deep in the pipeline, so mark them here where they are listed.

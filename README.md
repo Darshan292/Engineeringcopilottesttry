@@ -24,8 +24,11 @@ Each tool has a **Load sample** button with a realistic input.
 
 ```bash
 cp .env.example .env
-# paste a free key from https://console.groq.com/keys into .env
+# paste a free key into .env:
+#   Groq        https://console.groq.com/keys
+#   OpenRouter  https://openrouter.ai/settings/keys   (also set LLM_PROVIDER=openrouter)
 
+.venv/bin/python scripts/list_models.py --free   # what your key can actually call
 ./run.sh
 ```
 
@@ -36,6 +39,102 @@ uvicorn, httpx, pydantic, python-dotenv, PyYAML and openapi-spec-validator —
 all MIT/BSD/Apache-2.0.
 
 ---
+
+## Providers
+
+Groq and OpenRouter both work, as does any other OpenAI-compatible endpoint
+(Ollama, llama.cpp, vLLM, LM Studio). Pick one in `.env`:
+
+```bash
+# Groq (default)
+GROQ_API_KEY=gsk_...
+LLM_MODEL=openai/gpt-oss-120b
+
+# OpenRouter
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-v1-...
+LLM_MODEL=              # pick one — see below
+```
+
+**Do not trust any model list written in this repository.** Catalogues turn
+over fast. Ask your own key instead:
+
+```bash
+.venv/bin/python scripts/list_models.py --free
+```
+
+Groq ships a default model here because its chat catalogue is short and
+slow-moving. **OpenRouter deliberately does not**: hundreds of models, and free
+variants that appear and vanish as providers donate and withdraw capacity. Any
+ID compiled in would eventually become a confusing 404, so the app asks you to
+choose and points at the live list. Being told to pick beats being told a model
+you never picked is gone.
+
+### They differ in more than the URL
+
+This is the part that bites, and it is why `backend/providers.py` exists rather
+than a base-URL setting:
+
+| | Groq | OpenRouter (free) |
+|---|---|---|
+| Rations | **tokens** per minute | **requests**: 20/min, 50/day (1,000/day above $10 lifetime spend) |
+| 429 states the delay | `retry-after` + in the body | often **nothing at all** |
+| Reset header | a duration | a **Unix millisecond timestamp** |
+| Model list field | `context_window` | `context_length` |
+
+Each of those has a failure mode that is silent or absurd rather than obvious:
+
+- Treating "no stated delay" as "give up" reproduces, on OpenRouter, exactly the
+  bug the retry loop exists to fix. A 429 with nothing in it now backs off from
+  a per-provider default instead.
+- Reading a reset *instant* as a *duration* is a sleep of roughly fifty thousand
+  years. The parser checks the value's magnitude as well as the profile's flag,
+  so a stale table cannot cause it.
+- Budgeting a request-rationed provider against a token ceiling caps every call
+  at a limit that does not exist. Leave `TOKEN_LIMIT_PER_MINUTE` unset on
+  OpenRouter; unset means "not rationed" and the full context window is used.
+
+Request and token limits both default to the active provider's free tier, so
+the local limiter — not an upstream 429 — is normally what you hit first.
+
+---
+
+## It cannot spend your money
+
+`FREE_TIER_ONLY` is on by default, and it is not a naming convention or a
+promise to be careful. Nothing is callable until the provider's own price list
+has shown every one of its rates to be zero.
+
+Three independent layers, because any one of them can be wrong:
+
+| Layer | When | What it catches |
+|---|---|---|
+| Price list | before the call | a paid model, a model absent from the catalogue, a model quoting no prices, a `:free` suffix typo'd away, a router that selects paid models |
+| `provider.max_price = 0` | in the request | a catalogue that went stale between the check and the call, and a router whose choice is made after we stop looking |
+| Reported cost | after the call | anything the first two did not foresee — and it **latches**, refusing every later call until the process is restarted |
+
+Refusals happen before a socket is opened, so a misconfiguration costs nothing
+at all. `openrouter/auto` is named explicitly and blocked: it is priced at zero
+and selects from the whole catalogue, so no pricing check can see the cost.
+`openrouter/free` is allowed, because it routes only within free models.
+
+**One honest caveat.** Layer 1 only works where the provider publishes prices.
+Groq's model list has none — there, "free tier" is a property of your account,
+not of a model — so on Groq only layer 3 applies. `GET /api/config` reports
+which regime is actually in force under `billing.mode`, rather than implying a
+guarantee that is not being made.
+
+## Requests are the scarce resource, not tokens
+
+Groq rations tokens per minute. **OpenRouter's free tier rations requests**: 20
+a minute, and 50 a day until you have bought $10 of credit. That changes what
+"expensive" means.
+
+One browser click is one HTTP request and anything from one to thirty upstream
+calls. The provider counts the upstream ones. So the limiter counts them too,
+and the planner budgets against what is left today — a fourteen-call plan with
+twelve calls remaining is refused and degraded to a single call, with the
+arithmetic shown, rather than spending the rest of your afternoon.
 
 ## Rate limits are a delay, not a failure
 
@@ -291,7 +390,7 @@ Errors carry a remediation, not just a status code:
 ```json
 {
   "error": "Model 'llama-3.3-70b-versatile' is unavailable: model_not_found",
-  "hint": "'llama-3.3-70b-versatile' is retired: Decommissioned on the Groq free/developer tier on 2026-08-16. Set GROQ_MODEL=openai/gpt-oss-120b in .env and restart.",
+  "hint": "'llama-3.3-70b-versatile' is retired: Decommissioned on the Groq free/developer tier on 2026-08-16. Set LLM_MODEL=openai/gpt-oss-120b in .env and restart.",
   "request_id": "4e295766e9f1"
 }
 ```
@@ -301,7 +400,7 @@ Errors carry a remediation, not just a status code:
 ## Tests
 
 ```bash
-.venv/bin/pytest                        # 270 tests, no network, no key, no cost
+.venv/bin/pytest                        # 305 tests, no network, no key, no cost
 node --test tests/markdown.test.mjs     # 22 renderer tests including XSS
 ```
 
@@ -322,6 +421,9 @@ tests could not see it:
 - `test_rate_limit_recovery.py` proves a 429 is waited out and retried rather
   than surfaced, that a configured token limit is never raised by the provider,
   and that the limit and real per-call cost stated in a 429 body are adopted.
+- `test_providers.py` proves the things Groq and OpenRouter disagree about — in
+  particular that a Unix-millisecond reset instant is never read as a duration,
+  even if the provider profile's flag is wrong.
 
 **These prove the system behaves correctly. They say nothing about whether the
 model's analysis is any good.** That needs a real model:

@@ -42,6 +42,7 @@ from ..core.tokens import (
     ROUTING_MODEL_PRIOR,
     build_budget,
     estimate_tokens,
+    model_suggestion,
     non_chat_reason,
     suggested_models,
 )
@@ -196,6 +197,7 @@ async def _plan_and_budget(
     trace: Trace,
     model: str | None,
     warnings: list[str],
+    client_key: str = "local",
 ) -> ExecutionPlan:
     """Everything decided without the model: window, reserves, and the plan."""
     from ..config import settings
@@ -217,13 +219,14 @@ async def _plan_and_budget(
             f"'{chosen}' is {reason}. This application needs a chat model.",
             status=422,
             hint=(
-                f"Set GROQ_MODEL to one of: {', '.join(suggested_models())}. "
+                f"Set LLM_MODEL to one of: {model_suggestion()}. "
                 f"The provider's /models endpoint lists every model your key can call, "
                 f"including ones that do not serve chat completions."
             ),
         )
 
     from ..config import output_tokens_for
+    from ..governance import limiter as request_limiter
     from ..governance import token_limiter
 
     # A flat output reservation is wasteful where it is too large and truncating
@@ -264,8 +267,8 @@ async def _plan_and_budget(
             f"about {budget.reserved_for_system:,} tokens before any of your input.",
             status=422,
             hint=(
-                f"At least ~{MIN_USABLE_CONTEXT:,} tokens are needed. Set GROQ_MODEL to one of: "
-                f"{', '.join(suggested_models())}. Window source: {budget.window_source}."
+                f"At least ~{MIN_USABLE_CONTEXT:,} tokens are needed. Set LLM_MODEL to one of: "
+                f"{model_suggestion()}. Window source: {budget.window_source}."
             ),
         )
 
@@ -285,7 +288,7 @@ async def _plan_and_budget(
         )
         routing_note = ""
         remedy = (
-            f"Use a model with a larger window: {', '.join(suggested_models())}."
+            f"Use a model with a larger window: {model_suggestion()}."
             if window_bound
             else f"Raise TOKEN_LIMIT_PER_MINUTE above {budget.reserved_for_system + budget.reserved_for_output + budget.safety_margin:,}."
         )
@@ -293,7 +296,7 @@ async def _plan_and_budget(
             routing_note = (
                 f" '{chosen}' is a routing model, so the instruction reserve is inflated by about "
                 f"{ROUTING_MODEL_PRIOR:g}x to cover the tool schemas it sends on your behalf; a "
-                f"plain chat model such as {suggested_models()[0]} needs far less."
+                f"plain chat model needs far less; try {model_suggestion()}."
             )
         raise GroqError(
             f"No budget left for your input: {constraint}, and this request reserves "
@@ -327,21 +330,28 @@ async def _plan_and_budget(
                 f" '{chosen}' is a routing model: it sends its own instructions and tool "
                 f"schemas alongside your text, so one call costs roughly "
                 f"{ROUTING_MODEL_PRIOR:g}x what the visible input suggests. A plain chat "
-                f"model such as {suggested_models()[0]} does not carry that overhead."
+                f"model does not carry that overhead; try {model_suggestion()}."
             )
         warnings.append(
             f"Only {budget.available_for_input:,} of the {per_call:,} tokens available per call "
             f"can hold your input; the other {fixed:,} are the instructions, the reserved reply "
             f"and the safety margin. Splitting a large input will not help here, because every "
             f"part pays that {fixed:,} again.{routing_note} Raise TOKEN_LIMIT_PER_MINUTE if your "
-            f"account allows, or switch GROQ_MODEL."
+            f"account allows, or switch LLM_MODEL."
         )
 
     # Parsing and planning are CPU-bound and run on multi-megabyte inputs.
     # Doing that on the event loop stalls every other request, including
     # /api/health, for the whole duration.
     with timed(trace, "plan_context") as stage:
-        plan = await asyncio.to_thread(plan_context, ir, budget)
+        # How many upstream calls are left today, so the planner can refuse a
+        # plan that would spend more than the caller actually has. Only binds
+        # where the provider rations requests; elsewhere the allowance is large
+        # enough that it never does.
+        _, calls_left = request_limiter.remaining(client_key)
+        plan = await asyncio.to_thread(
+            plan_context, ir, budget, calls_remaining_today=calls_left
+        )
         stage.summary = {
             "strategy": plan.strategy,
             "chunks": len(plan.chunks),
@@ -376,7 +386,8 @@ async def _run(
     system_prompt = TOOL_PROMPTS[tool]
 
     decided = await _plan_and_budget(
-        tool, ir, system_prompt, trace=trace, model=model, warnings=warnings
+        tool, ir, system_prompt, trace=trace, model=model, warnings=warnings,
+        client_key=client_key,
     )
     plan = decided.plan
     budget = decided.budget
@@ -994,7 +1005,7 @@ async def preview(tool: str, raw: str, *, model=None, request_id=None) -> dict:
 
     decided = await _plan_and_budget(
         tool, ir, TOOL_PROMPTS[tool], trace=trace, model=model, warnings=warnings
-    )
+    )  # preview: no client key, so the daily budget does not narrow the plan
     plan = decided.plan
 
     # A plan that would be refused is reported as a plan, not raised as an

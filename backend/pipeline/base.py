@@ -227,6 +227,7 @@ async def call_structured(
     used_model = model or ""
 
     from ..governance import MAX_TOTAL_WAIT_SECONDS, await_token_budget, token_limiter
+    from ..governance import limiter as request_limiter
 
     for attempt in range(1, MAX_REPAIR_ATTEMPTS + 2):
         # Check the token budget before each attempt, including repairs. A
@@ -267,6 +268,10 @@ async def call_structured(
                 max_wait_seconds=max(0.0, MAX_TOTAL_WAIT_SECONDS - trace.waited_seconds),
             )
             trace.upstream_calls += 1
+            # The provider counts this call, so the local limiter must too.
+            # Counting only the browser request let one split input spend
+            # thirty of a fifty-call daily allowance while recording one.
+            request_limiter.record(client_key)
             # Time the provider held us back counts against the same budget as
             # time our own limiter held us back; both are waiting, and the user
             # is owed one honest number for it.
@@ -342,7 +347,7 @@ async def call_structured(
                 status=502,
                 hint=(
                     "This usually means the configured model struggles with structured output. "
-                    "Try GROQ_MODEL=openai/gpt-oss-120b, which follows JSON schemas more reliably "
+                    "Try LLM_MODEL=openai/gpt-oss-120b, which follows JSON schemas more reliably "
                     "than smaller models."
                 ),
             )

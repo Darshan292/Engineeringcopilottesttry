@@ -14,6 +14,7 @@ import uuid
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from ..billing import BillingRefused, guard
 from ..config import settings
 from ..governance import (
     GovernanceError,
@@ -103,6 +104,10 @@ async def _handle(tool: str, request: Request, body: ToolRequest, authorization:
         # Raised mid-pipeline by the token budget, including between repairs.
         log.warning("rid=%s tool=%s shed: %s", request_id, tool, exc.message)
         return _error(exc.message, exc.status, exc.hint, request_id, exc.headers)
+    except BillingRefused as exc:
+        # Not an error in the pipeline: a deliberate refusal to spend money.
+        log.warning("rid=%s tool=%s refused on billing: %s", request_id, tool, exc.message)
+        return _error(exc.message, exc.status, exc.hint, request_id)
     except GroqError as exc:
         log.warning("rid=%s tool=%s failed: %s", request_id, tool, exc.message)
         return _error(exc.message, exc.status, exc.hint, request_id)
@@ -190,6 +195,8 @@ async def plan(tool_id: str, request: Request, body: ToolRequest, authorization:
 
     try:
         result = await preview(tool_id, body.input, model=model, request_id=request_id)
+    except BillingRefused as exc:
+        return _error(exc.message, exc.status, exc.hint, request_id)
     except GroqError as exc:
         return _error(exc.message, exc.status, exc.hint, request_id)
     except Exception as exc:  # pragma: no cover - last-resort guard
@@ -226,6 +233,8 @@ async def config(request: Request):
         "governance": {**model_policy.public(), **auth_policy.public()},
         "rate_limit": limiter.snapshot(_client_key(request)),
         "token_budget": token_limiter.snapshot(_client_key(request)),
+        # Whether this deployment is allowed to spend money, and whether it has.
+        "billing": guard.public(),
     }
 
 

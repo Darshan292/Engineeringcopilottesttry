@@ -109,15 +109,26 @@ async function loadConfig() {
     const cfg = await res.json();
 
     els.modelName.textContent = cfg.model || "unknown";
-    els.modelName.parentElement.title = `Model: ${cfg.model}\nEndpoint: ${cfg.base_url}\nTemperature: ${cfg.temperature}\nMax tokens: ${cfg.max_tokens}`;
-    renderTokenBudget(cfg.token_budget);
+    els.modelName.parentElement.title =
+      `Provider: ${(cfg.provider && cfg.provider.label) || "unknown"}\n` +
+      `Model: ${cfg.model || "(not set)"}\nEndpoint: ${cfg.base_url}\n` +
+      `Temperature: ${cfg.temperature}\nMax tokens: ${cfg.max_tokens}`;
+    renderBudgetChip(cfg);
 
     if (!cfg.api_key_configured) {
+      // The key's name and where to get it both depend on the provider, so
+      // both come from the backend rather than being written in here.
+      const provider = cfg.provider || {};
+      const keyName = provider.provider === "openrouter" ? "OPENROUTER_API_KEY" : "GROQ_API_KEY";
+      const keysUrl =
+        provider.provider === "openrouter"
+          ? "https://openrouter.ai/settings/keys"
+          : "https://console.groq.com/keys";
       els.statusDot.className = "dot dot-bad";
       showBanner(
-        "No GROQ_API_KEY set.",
-        ' Every request will fail until you configure one. Run <code>cp .env.example .env</code>, ' +
-          'paste a free key from <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>, ' +
+        `No ${escapeHtml(keyName)} set.`,
+        " Every request will fail until you configure one. Run <code>cp .env.example .env</code>, " +
+          `paste a free key from <a href="${keysUrl}" target="_blank" rel="noopener">${escapeHtml(keysUrl)}</a>, ` +
           "then restart the server.",
         "bad"
       );
@@ -139,10 +150,38 @@ async function loadConfig() {
 }
 
 /**
- * Tokens per minute is the constraint a free-tier account actually hits --
- * requests per minute is far more generous. Showing what is left makes a 429
- * predictable instead of surprising.
+ * Show whichever allowance the provider actually rations.
+ *
+ * Groq rations tokens per minute; OpenRouter's free tier rations requests, and
+ * reports no token ceiling at all. Hiding the chip when there is no token limit
+ * left the one number that matters on that provider -- how many of today's 50
+ * requests are left -- visible nowhere.
  */
+function renderBudgetChip(config) {
+  const tokens = config.token_budget;
+  if (tokens && tokens.limit_per_minute) {
+    renderTokenBudget(tokens);
+    return;
+  }
+  const requests = config.rate_limit;
+  if (!requests || !requests.limit_per_day) {
+    els.tokenBudget.hidden = true;
+    return;
+  }
+  const leftToday = Math.max(0, requests.limit_per_day - (requests.used_today || 0));
+  const leftMinute = Math.max(0, requests.limit_per_minute - (requests.used_this_minute || 0));
+  els.tokenBudget.hidden = false;
+  els.tokenBudget.textContent = `${leftToday.toLocaleString()}/${requests.limit_per_day.toLocaleString()} req`;
+  els.tokenBudget.className =
+    "budget" +
+    (leftToday === 0 ? " budget-out" : leftToday < requests.limit_per_day * 0.3 ? " budget-low" : "");
+  els.tokenBudget.title =
+    `This provider limits requests, not tokens.\n` +
+    `Today: ${leftToday.toLocaleString()} of ${requests.limit_per_day.toLocaleString()} left.\n` +
+    `This minute: ${leftMinute.toLocaleString()} of ${requests.limit_per_minute.toLocaleString()} left.\n` +
+    `Requests are shed locally when the budget is spent, so no upstream quota is wasted.`;
+}
+
 function renderTokenBudget(budget) {
   if (!budget || !budget.limit_per_minute) {
     els.tokenBudget.hidden = true;
@@ -164,7 +203,7 @@ function renderTokenBudget(budget) {
 async function refreshTokenBudget() {
   try {
     const res = await fetch("/api/config");
-    renderTokenBudget((await res.json()).token_budget);
+    renderBudgetChip(await res.json());
   } catch {
     /* transient; the next run refreshes it */
   }

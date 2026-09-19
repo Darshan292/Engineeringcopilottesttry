@@ -239,12 +239,31 @@ def non_chat_reason(model: str) -> str | None:
 
 
 def suggested_models() -> list[str]:
-    """Chat models known to work, preferring what the provider confirmed."""
+    """Chat models known to work, preferring what the provider confirmed.
+
+    The registry fills from the live `/api/models` call, so after one request
+    these are real ids for whichever provider is configured. The hardcoded
+    fallback is Groq's, and is only offered when the provider is Groq -- naming
+    `openai/gpt-oss-120b` to someone on OpenRouter is advice that does not work.
+    """
     known = [m for m in registry._windows if non_chat_reason(m) is None and registry._windows[m] >= MIN_USABLE_CONTEXT]
     if known:
         # Largest window first: more headroom means fewer compressions.
         return sorted(known, key=lambda m: -registry._windows[m])[:4]
-    return ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+
+    from ..config import settings
+
+    if settings.provider == "groq":
+        return ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+    return []
+
+
+def model_suggestion() -> str:
+    """A sentence naming what to switch to, or how to find out."""
+    models = suggested_models()
+    if models:
+        return ", ".join(models)
+    return "one from GET /api/models (run: python scripts/list_models.py --free)"
 
 
 class ModelRegistry:

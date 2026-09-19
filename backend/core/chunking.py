@@ -363,6 +363,7 @@ def plan_context(
     detail_hint: str = "full",
     max_chunks: int | None = None,
     max_plan_seconds: int | None = None,
+    calls_remaining_today: int | None = None,
     per_call_ceiling: int | None = None,
 ) -> ContextPlan:
     """Decide how this IR will be presented to the model.
@@ -607,6 +608,21 @@ def plan_context(
     )
     calls = len(chunks) + reduce_calls
 
+    # A request-rationed provider makes the call count the scarce resource
+    # rather than a detail. On OpenRouter's free tier a whole day is fifty
+    # calls, so a fourteen-call plan is not "slow" -- it is a quarter of today
+    # spent on one paste, and every refusal afterwards looks like the
+    # application being broken rather than the quota being gone.
+    #
+    # Checked against the total, not the part count: the combine tree costs
+    # about as many calls again, so capping chunks alone let a plan needing
+    # fourteen through with twelve remaining.
+    over_daily_budget = (
+        calls_remaining_today is not None
+        and calls_remaining_today > 0
+        and calls > calls_remaining_today
+    )
+
     if not converges:
         per_batch = max(1, reduce_ceiling // max(1, map_output_tokens))
         foldable = per_batch ** MAX_REDUCE_LEVELS
@@ -645,8 +661,12 @@ def plan_context(
     too_many = len(chunks) > max_chunks
     too_slow = projected_seconds > max_plan_seconds
 
-    if too_many or too_slow:
+    if too_many or too_slow or over_daily_budget:
         limits = []
+        if over_daily_budget:
+            limits.append(
+                f"{calls} calls exceeds the {calls_remaining_today} left in today's allowance"
+            )
         if too_many:
             limits.append(f"{len(chunks)} parts exceeds the limit of {max_chunks}")
         if too_slow:

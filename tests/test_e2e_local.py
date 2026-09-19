@@ -189,7 +189,7 @@ def test_404_model_not_found_surfaces_a_fix(http_client):
     mock_state["mode"] = "model_gone"
     res = http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     assert res.status_code == 502
-    assert "GROQ_MODEL" in res.json()["hint"]
+    assert "LLM_MODEL" in res.json()["hint"]
 
 
 def test_a_transient_429_is_waited_out_and_the_request_still_succeeds(http_client, monkeypatch):

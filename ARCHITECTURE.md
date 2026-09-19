@@ -200,6 +200,41 @@ the name→placeholder table is never serialized. The model cannot leak a name i
 was never shown. A second check rejects any participant role that is not a real
 transcript participant.
 
+## Providers: same wire format, different margins
+
+Every endpoint this supports speaks OpenAI-compatible chat completions, which is
+why swapping one for another looks like changing a URL. It is not, and
+`backend/providers.py` exists because the differences are all in places where
+being wrong is silent.
+
+Three of them matter enough to name:
+
+**What they ration.** Groq's free tier binds on tokens per minute. OpenRouter's
+binds on requests — per minute and per day — and reports no token ceiling at
+all. The whole budgeting layer is built around a token allowance, so a
+request-rationed provider has to be able to say "not rationed" and get the
+model's full context window. Zero means exactly that; it does not mean zero.
+
+**How they say "come back later".** Groq sends `retry-after` and repeats the
+delay in the error body. OpenRouter's free-tier per-minute 429 sends neither,
+and states when the window reopens as `X-RateLimit-Reset`: a Unix timestamp in
+milliseconds. Two failure modes follow. Treating a missing delay as "give up"
+reproduces the bug the retry loop was written to fix, one provider over — so a
+429 stating nothing backs off from a per-provider default instead. And reading
+that instant as a duration is a sleep of about fifty thousand years, so
+`seconds_until_reset` checks the value's own magnitude in addition to the
+profile's flag. A profile can go stale; arithmetic on the number cannot.
+
+**What they call things.** `context_window` against `context_length`, sometimes
+nested under `top_provider`. Accepted liberally, because the alternative is
+every model reporting an unknown window and the planner falling back to a
+conservative 8,192 for a model with 163,840.
+
+Selection is `LLM_PROVIDER`, else inferred from the base URL's host, else Groq
+for the .env files that already exist. An unrecognised endpoint gets a
+conservative generic profile rather than Groq's rules, because assuming one
+vendor's margins for another is the mistake this module exists to stop.
+
 ## Rate limits, and why they are not errors
 
 The pre-flight limiter and the post-flight back-off solve different halves of
@@ -279,6 +314,13 @@ These are real and not papered over:
   that trust is misplaced.
 - **The rate limiter is per-process.** In-memory, so it is load shedding for a
   single instance, not a distributed quota.
+- **OpenRouter's exact limits were not verifiable from here.** The 20/min and
+  50/day free-tier figures, and the millisecond reset header, come from their
+  published documentation rather than from a call made by this code —
+  `openrouter.ai` is unreachable from the environment this was built in. They
+  are defaults, overridable by `RATE_LIMIT_PER_MINUTE`/`RATE_LIMIT_PER_DAY`, and
+  the reset parser tolerates being wrong about the units. `scripts/list_models.py`
+  checks the rest against a real key in one command.
 - **The routing-model correction is a prior, not a measurement.** `2.3x` comes
   from one observed pair (6,044 estimated against 13,761 counted by Groq for
   `groq/compound`). It is a starting point that the first real 429 or completion
