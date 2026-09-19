@@ -22,6 +22,8 @@ what makes concurrent requests debuggable at all.
 
 from __future__ import annotations
 
+import logging
+import time
 import inspect
 import json
 import re
@@ -38,7 +40,7 @@ T = TypeVar("T", bound=BaseModel)
 
 MAX_REPAIR_ATTEMPTS = 2
 
-
+log = logging.getLogger("copilot.pipeline")
 # --- tracing --------------------------------------------------------------
 
 
@@ -240,11 +242,26 @@ async def call_structured(
         # Wait for budget rather than failing. On a rate-limited account a
         # multi-part analysis genuinely takes minutes, and a complete answer
         # that arrives slowly is worth more than a fast refusal.
+        log.info(
+            "[DEBUG] rid=%s TOKEN WAIT CHECK stage=%s attempt=%d projected=%d",
+            trace.request_id,
+            stage_name,
+            attempt,
+            projected,
+        )
         waited, reservation = await await_token_budget(
             client_key,
             projected,
             stage=f"{stage_name} attempt {attempt}" if attempt > 1 else stage_name,
             waited_so_far=trace.waited_seconds,
+        )
+
+        log.info(
+            "[DEBUG] rid=%s TOKEN WAIT DONE stage=%s attempt=%d waited=%.1fs",
+            trace.request_id,
+            stage_name,
+            attempt,
+            waited,
         )
         trace.waited_seconds += waited
         if waited:
@@ -253,6 +270,18 @@ async def call_structured(
                 time.perf_counter() - waited,
                 {"waited_seconds": round(waited, 1), "reason": "token allowance"},
             )
+
+        log.info(
+            "[DEBUG] rid=%s LLM START stage=%s attempt=%d model=%s input_chars=%d max_tokens=%s",
+            trace.request_id,
+            stage_name,
+            attempt,
+            model,
+            len(messages_user),
+            max_tokens,
+        )
+
+        llm_started = time.perf_counter()
 
         with timed(trace, f"{stage_name}.attempt{attempt}") as stage:
             result = await complete(
@@ -266,6 +295,21 @@ async def call_structured(
                 # back-off. Two independent budgets would let a request wait
                 # twice as long as anyone agreed to.
                 max_wait_seconds=max(0.0, MAX_TOTAL_WAIT_SECONDS - trace.waited_seconds),
+            )
+            log.info(
+                "[DEBUG] CALL_STRUCTURED GOT LLM RESULT stage=%s attempt=%d",
+                stage_name,
+                attempt,
+            )
+            log.info(
+                "[DEBUG] rid=%s LLM DONE stage=%s attempt=%d elapsed=%.2fs finish_reason=%s "
+                "tokens=%s",
+                trace.request_id,
+                stage_name,
+                attempt,
+                time.perf_counter() - llm_started,
+                result.get("finish_reason"),
+                result.get("usage", {}).get("total_tokens"),
             )
             trace.upstream_calls += 1
             # The provider counts this call, so the local limiter must too.
@@ -293,6 +337,12 @@ async def call_structured(
             # the surplus when it was high stops a conservative output reserve
             # from permanently eating a slice of every minute.
             actual = int(result["usage"].get("total_tokens") or projected)
+            log.info(
+                "[DEBUG] rid=%s TOKEN USAGE projected=%d actual=%d",
+                trace.request_id,
+                projected,
+                actual,
+            )
             token_limiter.settle(reservation, actual)
             last_raw = result["text"]
             used_model = result["model"]
@@ -328,6 +378,13 @@ async def call_structured(
                             domain_errors.append(message)
                     if not domain_errors:
                         stage.summary["outcome"] = "valid"
+                        log.warning(
+                            "[DEBUG] rid=%s VALIDATION FAILED stage=%s attempt=%d feedback=%s",
+                            trace.request_id,
+                            stage_name,
+                            attempt,
+                            feedback.splitlines()[0][:300] if feedback else "(none)",
+                        )
                         return StructuredResult(
                             value=value,
                             attempts=attempt,
@@ -339,6 +396,12 @@ async def call_structured(
                         )
                     stage.summary["outcome"] = "domain_invalid"
                     feedback = "\n\n".join(domain_errors)
+                    log.info(
+                        "[DEBUG] rid=%s REPAIRING stage=%s next_attempt=%d",
+                        trace.request_id,
+                        stage_name,
+                        attempt + 1,
+                    )
 
         if attempt > MAX_REPAIR_ATTEMPTS:
             raise LLMError(

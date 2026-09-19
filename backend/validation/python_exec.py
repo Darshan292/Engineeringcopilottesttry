@@ -50,6 +50,10 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+import logging
+import time
+
+log = logging.getLogger("copilot.pipeline")
 
 DEFAULT_TIMEOUT_SECONDS = 30
 _CPU_SECONDS = 20
@@ -287,6 +291,12 @@ def run_python_tests(
 ) -> tuple[ExecutionReport, list[str]]:
     """Execute generated tests against the source. Returns (report, rewrite notes)."""
     report = ExecutionReport()
+    log.info(
+        "[DEBUG] PYTEST START source_chars=%d test_chars=%d timeout=%ds",
+        len(source_code),
+        len(test_code),
+        timeout
+    )
 
     if not execution_enabled():
         report.skipped_reason = "ENABLE_TEST_EXECUTION is false."
@@ -311,6 +321,11 @@ def run_python_tests(
         (workdir / "conftest.py").write_text(_CONFTEST, encoding="utf-8")
 
         wrapper, isolation = _sandbox_wrapper(workdir)
+        log.info(
+            "[DEBUG] PYTEST SANDBOX isolation=%s workdir=%s",
+            isolation,
+            workdir,
+        )
         report.isolation = isolation
 
         env = {
@@ -328,6 +343,10 @@ def run_python_tests(
 
         started = time.perf_counter()
         try:
+            log.info(
+                "[DEBUG] PYTEST SUBPROCESS START isolation=%s",
+                isolation,
+            )
             completed = subprocess.run(
                 [
                     *wrapper,
@@ -345,7 +364,16 @@ def run_python_tests(
                 preexec_fn=_limit_resources if os.name == "posix" else None,
             )
             output = f"{completed.stdout}\n{completed.stderr}"
+            log.info(
+                "[DEBUG] PYTEST SUBPROCESS DONE exit_code=%s duration=%.2fs",
+                completed.returncode,
+                time.perf_counter() - started,
+            )
         except subprocess.TimeoutExpired:
+            log.error(
+                "[DEBUG] PYTEST TIMEOUT after %ss",
+                timeout,
+            )
             report.ran = True
             report.duration_seconds = timeout
             report.collection_error = (

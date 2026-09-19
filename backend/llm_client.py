@@ -345,8 +345,9 @@ async def complete(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "temperature": settings.temperature if temperature is None else temperature,
-        "max_tokens": settings.max_tokens if max_tokens is None else max_tokens,
+        # "temperature": settings.temperature if temperature is None else temperature,
+        # "max_tokens": settings.max_tokens if max_tokens is None else max_tokens,
+        # "reasoning": {"enabled": True},
         "stream": False,
     }
     if json_mode:
@@ -365,19 +366,52 @@ async def complete(
 
     async def post() -> httpx.Response:
         try:
+            log.info(
+                "[DEBUG] HTTP POST START model=%s url=%s",
+                chosen_model,
+                f"{settings.base_url}/chat/completions",
+            )
+
+            post_started = time.perf_counter()
+
             async with _client() as client:
-                return await client.post(
+                response = await client.post(
                     f"{settings.base_url}/chat/completions",
                     headers=_auth_headers(),
                     json=body,
                 )
+
+            log.info(
+                "[DEBUG] HTTP POST RETURNED status=%s elapsed=%.2fs",
+                response.status_code,
+                time.perf_counter() - post_started,
+            )
+
+            log.info(
+                "[DEBUG] RESPONSE BODY AVAILABLE bytes=%s",
+                len(response.content),
+            )
+
+            return response
+
         except httpx.TimeoutException as exc:
+            log.error(
+                "[DEBUG] HTTP TIMEOUT after %.2fs",
+                time.perf_counter() - post_started,
+            )
             raise LLMError(
-                f"{_provider().label} did not respond within {settings.timeout_seconds:.0f}s.",
+                f"{_provider().label} did not respond within "
+                f"{settings.timeout_seconds:.0f}s.",
                 status=504,
                 hint="Try a shorter input, or raise LLM_TIMEOUT_SECONDS in .env.",
             ) from exc
+
         except httpx.HTTPError as exc:
+            log.error(
+                "[DEBUG] HTTP ERROR type=%s error=%s",
+                type(exc).__name__,
+                exc,
+            )
             raise LLMError(
                 f"Could not reach {_provider().label}: {exc}",
                 status=502,
@@ -397,7 +431,17 @@ async def complete(
     else:
         budget_left = max(0.0, max_wait_seconds)
     while True:
+        log.info(
+            "[DEBUG] POST AWAIT START model=%s",
+            chosen_model,
+        )
+
         response = await post()
+
+        log.info(
+            "[DEBUG] POST AWAIT COMPLETE status=%s",
+            response.status_code,
+        )
 
         try:
             from .governance import adopt_provider_limits
@@ -442,10 +486,34 @@ async def complete(
     if response.status_code >= 400:
         raise _translate_http_error(response, chosen_model)
 
+    log.info("[DEBUG] RESPONSE JSON PARSE START")
+
     try:
         payload = response.json()
+
+        log.info(
+            "[DEBUG] RESPONSE JSON PARSED top_keys=%s",
+            list(payload.keys()),
+        )
+
         choice = payload["choices"][0]
-        text = choice["message"]["content"] or ""
+
+        log.info(
+            "[DEBUG] CHOICE PARSED keys=%s finish_reason=%s",
+            list(choice.keys()),
+            choice.get("finish_reason"),
+        )
+
+        message = choice["message"]
+
+        log.info(
+            "[DEBUG] MESSAGE PARSED keys=%s content_type=%s",
+            list(message.keys()),
+            type(message.get("content")).__name__,
+        )
+
+        text = message.get("content") or ""
+
     except (ValueError, KeyError, IndexError) as exc:
         raise LLMError(
             f"{_provider().label} returned a response this app could not parse: {exc}",
@@ -453,7 +521,15 @@ async def complete(
             hint="This usually means the endpoint is not OpenAI-compatible. Check LLM_BASE_URL.",
         ) from exc
 
+    log.info(
+        "[DEBUG] FINAL TEXT length=%d",
+        len(text),
+    )
     if not text.strip():
+        log.error(
+            "[DEBUG] EMPTY COMPLETION finish_reason=%s",
+            choice.get("finish_reason"),
+        )
         raise LLMError(
             f"{_provider().label} returned an empty completion.",
             status=502,
@@ -469,7 +545,14 @@ async def complete(
     # non-zero figure here means the price list and the provider-side ceiling
     # were both wrong, which is the case no amount of pre-flight checking can
     # rule out -- so it latches and the next call is refused.
+    log.info("[DEBUG] BILLING CHECK START")
+
     charged = guard.observe_usage(chosen_model, usage)
+
+    log.info(
+        "[DEBUG] BILLING CHECK DONE cost=%s",
+        charged,
+    )
 
     # Close the calibration loop: compare what we estimated for this exact
     # payload against what the server actually charged, so future budgets for
@@ -487,6 +570,13 @@ async def complete(
         except Exception:
             # Calibration is an optimisation; never fail a good response over it.
             pass
+
+    log.info(
+        "[DEBUG] COMPLETE RETURN model=%s elapsed=%.2fs total_tokens=%s",
+        chosen_model,
+        time.perf_counter() - started,
+        usage.get("total_tokens"),
+    )
 
     return {
         "text": text.strip(),

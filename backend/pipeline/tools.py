@@ -65,7 +65,10 @@ from ..validation.python_exec import run_python_tests
 from ..validation.schemas import APIDocOutput, PostmortemOutput, RCAOutput, UnitTestOutput
 from .base import StructuredResult as StructuredResultLike
 from .base import Trace, call_structured, timed
+import logging
+import time
 
+log = logging.getLogger("copilot.pipeline")
 
 @dataclass
 class PipelineResult:
@@ -100,6 +103,12 @@ async def _preprocess_async(tool: str, raw: str, trace: Trace) -> tuple[str, dic
 
 
 def _preprocess(tool: str, raw: str, trace: Trace) -> tuple[str, dict, list[str]]:
+    log.info(
+        "[DEBUG] rid=%s tool=%s PREPROCESS START chars=%d",
+        trace.request_id,
+        tool,
+        len(raw),
+    )
     """Redact, classify and defang. Returns (safe_text, diagnostics, warnings)."""
     warnings: list[str] = []
     diagnostics: dict = {}
@@ -157,6 +166,14 @@ def _preprocess(tool: str, raw: str, trace: Trace) -> tuple[str, dict, list[str]
             hint="This is a bug in the redaction pipeline. Please report the input shape that caused it.",
         )
 
+    log.info(
+        "[DEBUG] rid=%s tool=%s PREPROCESS DONE chars=%d warnings=%d",
+        trace.request_id,
+        tool,
+        len(safe),
+        len(warnings),
+    )
+
     return safe, diagnostics, warnings
 
 
@@ -205,11 +222,24 @@ async def _plan_and_budget(
 
     # Context windows come from the provider where possible. One cheap GET per
     # hour beats budgeting against a table that was correct when it was written.
+    log.info(
+            "[DEBUG] rid=%s PLAN/BUDGET START tool=%s model=%s",
+            trace.request_id,
+            tool,
+            model,
+    )
     with timed(trace, "model_metadata") as stage:
         refreshed = await refresh_model_registry_if_stale()
+        log.info(
+            "[DEBUG] rid=%s MODEL METADATA refreshed=%s",
+            trace.request_id,
+            refreshed,
+        )
         stage.summary = {"refreshed": refreshed}
 
     chosen = model or settings.model
+
+    
 
     # A model that cannot do chat completions fails somewhere confusing and
     # late. Say so here, by name, with something that works.
@@ -351,6 +381,14 @@ async def _plan_and_budget(
         _, calls_left = request_limiter.remaining(client_key)
         plan = await asyncio.to_thread(
             plan_context, ir, budget, calls_remaining_today=calls_left
+        )
+        log.info(
+            "[DEBUG] rid=%s PLAN DONE strategy=%s chunks=%d estimated_calls=%s estimated_seconds=%s",
+            trace.request_id,
+            plan.strategy,
+            len(plan.chunks),
+            getattr(plan, "estimated_calls", None),
+            getattr(plan, "estimated_seconds", None),
         )
         stage.summary = {
             "strategy": plan.strategy,
@@ -598,11 +636,24 @@ async def _await_token_budget(client_key: str, needed: int, trace: Trace, label:
     refused plans whose total wait would be unreasonable.
     """
     from ..governance import token_limiter
+    log.info(
+        "[DEBUG] rid=%s PACER START label=%s needed=%d",
+        trace.request_id,
+        label,
+        needed,
+    )
 
     deadline = asyncio.get_running_loop().time() + 300
     waited = 0.0
     while True:
         allowed, _reason, retry_after = token_limiter.check(client_key, needed)
+        log.info(
+            "[DEBUG] rid=%s PACER CHECK label=%s allowed=%s retry_after=%s",
+            trace.request_id,
+            label,
+            allowed,
+            retry_after,
+        )
         if allowed:
             if waited:
                 trace.record(f"paced.{label}", asyncio.get_running_loop().time() - waited, {"waited_s": round(waited, 1)})
@@ -615,6 +666,12 @@ async def _await_token_budget(client_key: str, needed: int, trace: Trace, label:
             )
         pause = min(max(1, retry_after), 15)
         waited += pause
+        log.info(
+            "[DEBUG] rid=%s PACER SLEEP label=%s pause=%ss",
+            trace.request_id,
+            label,
+            pause,
+        )
         await asyncio.sleep(pause)
 
 
@@ -777,10 +834,29 @@ async def run_postmortem(raw: str, *, model=None, temperature=None, request_id=N
 async def run_unit_tests(raw: str, *, model=None, temperature=None, request_id=None, client_key="local") -> PipelineResult:
     trace = Trace(request_id or uuid.uuid4().hex[:12])
     safe, diagnostics, warnings = await _preprocess_async("unit-tests", raw, trace)
+    log.info(
+        "[DEBUG] rid=%s UNIT TEST PIPELINE START chars=%d model=%s",
+        trace.request_id,
+        len(raw),
+        model,
+    )
 
     with timed(trace, "parse") as stage:
         language = detect_language(safe).value
+        log.info(
+            "[DEBUG] rid=%s PARSE START language=%s",
+            trace.request_id,
+            language,
+        )
         ir = await asyncio.to_thread(parse_code, safe, language)
+        log.info(
+            "[DEBUG] rid=%s PARSE DONE functions=%d classes=%d parser=%s confidence=%.2f",
+            trace.request_id,
+            len(ir.all_functions()),
+            len(ir.classes),
+            ir.parser,
+            ir.confidence,
+        )
         stage.summary = {"language": ir.language, "functions": len(ir.all_functions())}
     diagnostics["parse"] = ir.stats()
 
@@ -816,7 +892,29 @@ async def run_unit_tests(raw: str, *, model=None, temperature=None, request_id=N
             execution_holder["report"] = None
             return ""
         # subprocess.run blocks for up to the timeout; off the loop it goes.
+        log.info(
+            "[DEBUG] rid=%s EXECUTION START generated_test_chars=%d",
+            trace.request_id,
+            len(value.test_code),
+        )
+
+        execution_started = time.perf_counter()
+
         report, notes = await asyncio.to_thread(run_python_tests, safe, value.test_code, defined)
+
+        log.info(
+            "[DEBUG] rid=%s EXECUTION DONE elapsed=%.2fs ran=%s "
+            "collected=%s passed=%s failed=%s errors=%s isolation=%s",
+            trace.request_id,
+            time.perf_counter() - execution_started,
+            report.ran,
+            report.collected,
+            report.passed,
+            report.failed,
+            report.errors,
+            report.isolation,
+        )
+        
         execution_holder["report"] = report
         execution_holder["notes"] = notes
         if report.skipped_reason:

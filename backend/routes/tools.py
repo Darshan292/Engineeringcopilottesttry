@@ -9,6 +9,7 @@ carries the request ID and the diagnostics needed to audit it.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -92,6 +93,7 @@ async def _handle(tool: str, request: Request, body: ToolRequest, authorization:
     try:
         # Bound in-flight upstream calls so a burst of tabs cannot turn into a
         # burst of simultaneous provider requests.
+        request_started = time.perf_counter()
         async with concurrency_slot():
             result = await PIPELINES[tool](
                 body.input,
@@ -100,6 +102,13 @@ async def _handle(tool: str, request: Request, body: ToolRequest, authorization:
                 request_id=request_id,
                 client_key=_client_key(request),
             )
+        log.info(
+            "rid=%s PIPELINE COMPLETE tool=%s elapsed=%.2fs calls=%d",
+            request_id,
+            tool,
+            time.perf_counter() - request_started,
+            result.trace.upstream_calls,
+        )
     except GovernanceError as exc:
         # Raised mid-pipeline by the token budget, including between repairs.
         log.warning("rid=%s tool=%s shed: %s", request_id, tool, exc.message)
