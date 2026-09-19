@@ -2,7 +2,7 @@
 """Ask the configured provider what this key can actually call.
 
 Run it before setting `LLM_MODEL`, and again whenever a model starts returning
-404. No list compiled into this application can stay true -- Groq retires chat
+404. No list compiled into this application can stay true -- providers retire chat
 models every few months, and OpenRouter's free variants appear and disappear as
 providers donate and withdraw capacity -- so the only trustworthy answer comes
 from your own key.
@@ -50,12 +50,12 @@ async def main() -> int:
     _load_dotenv()
 
     from backend.config import settings
-    from backend.groq_client import GroqError, list_models
+    from backend.llm_client import LLMError, list_models
     from backend.providers import api_key_env_name, detect_provider
 
-    provider = detect_provider(settings.groq_base_url)
-    print(f"provider : {provider.label} ({settings.groq_base_url})")
-    print(f"model    : {settings.groq_model or '(not set)'}")
+    provider = detect_provider(settings.base_url)
+    print(f"provider : {provider.label} ({settings.base_url})")
+    print(f"model    : {settings.model or '(not set)'}")
 
     if not settings.has_api_key:
         print(
@@ -66,7 +66,7 @@ async def main() -> int:
 
     try:
         models = await list_models()
-    except GroqError as exc:
+    except LLMError as exc:
         print(f"\nCould not list models: {exc.message}")
         if exc.hint:
             print(f"  {exc.hint}")

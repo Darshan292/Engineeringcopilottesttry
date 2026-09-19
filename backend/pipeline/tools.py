@@ -46,7 +46,7 @@ from ..core.tokens import (
     non_chat_reason,
     suggested_models,
 )
-from ..groq_client import GroqError
+from ..llm_client import LLMError
 from ..parsers.code import parse_code
 from ..parsers.logs import parse_logs
 from ..parsers.routes import parse_routes
@@ -109,7 +109,7 @@ def _preprocess(tool: str, raw: str, trace: Trace) -> tuple[str, dict, list[str]
         diagnostics["redaction"] = redaction.public()
         stage.summary = {"redacted": redaction.redacted_count}
         if redaction.has_credentials and fail_closed():
-            raise GroqError(
+            raise LLMError(
                 f"Refusing to process: this input contains credentials "
                 f"({redaction.counts_by_kind()}) and REDACTION_FAIL_CLOSED is enabled.",
                 status=422,
@@ -151,7 +151,7 @@ def _preprocess(tool: str, raw: str, trace: Trace) -> tuple[str, dict, list[str]
     # Final gate: nothing that was redacted may survive into the outbound text.
     leaked = assert_no_secrets(safe, redaction)
     if leaked:
-        raise GroqError(
+        raise LLMError(
             f"Refusing to send: redacted values of kind {leaked} survived preprocessing.",
             status=500,
             hint="This is a bug in the redaction pipeline. Please report the input shape that caused it.",
@@ -201,7 +201,7 @@ async def _plan_and_budget(
 ) -> ExecutionPlan:
     """Everything decided without the model: window, reserves, and the plan."""
     from ..config import settings
-    from ..groq_client import refresh_model_registry_if_stale
+    from ..llm_client import refresh_model_registry_if_stale
 
     # Context windows come from the provider where possible. One cheap GET per
     # hour beats budgeting against a table that was correct when it was written.
@@ -209,13 +209,13 @@ async def _plan_and_budget(
         refreshed = await refresh_model_registry_if_stale()
         stage.summary = {"refreshed": refreshed}
 
-    chosen = model or settings.groq_model
+    chosen = model or settings.model
 
     # A model that cannot do chat completions fails somewhere confusing and
     # late. Say so here, by name, with something that works.
     reason = non_chat_reason(chosen)
     if reason:
-        raise GroqError(
+        raise LLMError(
             f"'{chosen}' is {reason}. This application needs a chat model.",
             status=422,
             hint=(
@@ -261,7 +261,7 @@ async def _plan_and_budget(
     per_call_ceiling = budget.available_for_input
 
     if budget.context_window < MIN_USABLE_CONTEXT:
-        raise GroqError(
+        raise LLMError(
             f"'{chosen}' has a {budget.context_window:,}-token context window, which is too "
             f"small for this application. The instructions and output contract alone need "
             f"about {budget.reserved_for_system:,} tokens before any of your input.",
@@ -298,7 +298,7 @@ async def _plan_and_budget(
                 f"{ROUTING_MODEL_PRIOR:g}x to cover the tool schemas it sends on your behalf; a "
                 f"plain chat model needs far less; try {model_suggestion()}."
             )
-        raise GroqError(
+        raise LLMError(
             f"No budget left for your input: {constraint}, and this request reserves "
             f"{budget.reserved_for_output:,} for the reply, {budget.reserved_for_system:,} for "
             f"instructions and {budget.safety_margin:,} as margin.",
@@ -308,7 +308,7 @@ async def _plan_and_budget(
 
     if budget.window_source.startswith("conservative"):
         warnings.append(
-            f"The context window for '{model or settings.groq_model}' is not known to this "
+            f"The context window for '{model or settings.model}' is not known to this "
             f"deployment and could not be read from the provider, so a conservative "
             f"{budget.context_window:,}-token window was assumed. Large inputs may be "
             f"compressed or refused more aggressively than necessary."
@@ -405,7 +405,7 @@ async def _run(
         # that explained *why* only 52 tokens per call were left -- leaving a
         # message that said "raise the limit" without saying what was eating it.
         diagnosis = " ".join(w for w in warnings if "tokens available per call" in w)
-        raise GroqError(
+        raise LLMError(
             plan.reason,
             status=413,
             hint=(diagnosis or "See the reason above for the available options."),
@@ -552,7 +552,7 @@ async def _run(
             break
 
         if level > 4:  # pathological input; stop rather than loop
-            raise GroqError(
+            raise LLMError(
                 f"Combining {len(partials)} partial analyses did not converge within 4 levels.",
                 status=413,
                 hint=(
@@ -608,7 +608,7 @@ async def _await_token_budget(client_key: str, needed: int, trace: Trace, label:
                 trace.record(f"paced.{label}", asyncio.get_running_loop().time() - waited, {"waited_s": round(waited, 1)})
             return
         if asyncio.get_running_loop().time() >= deadline:
-            raise GroqError(
+            raise LLMError(
                 f"Gave up waiting for token budget before {label}.",
                 status=429,
                 hint="Raise TOKEN_LIMIT_PER_MINUTE, or narrow the input so fewer calls are needed.",
@@ -640,7 +640,7 @@ async def run_log_rca(raw: str, *, model=None, temperature=None, request_id=None
     diagnostics["parse"] = ir.stats()
 
     if not ir.entries:
-        raise GroqError("No log lines could be parsed from this input.", status=422,
+        raise LLMError("No log lines could be parsed from this input.", status=422,
                         hint="The Log/RCA tool expects log output. Check you pasted the right thing.")
 
     result, plan = await _run(
@@ -697,7 +697,7 @@ async def run_postmortem(raw: str, *, model=None, temperature=None, request_id=N
     diagnostics["parse"] = ir.stats()
 
     if not ir.utterances:
-        raise GroqError(
+        raise LLMError(
             "No speaker turns could be parsed from this transcript.", status=422,
             hint="Expected lines like '[02:18] Name: message'. Check the format of what you pasted.",
         )

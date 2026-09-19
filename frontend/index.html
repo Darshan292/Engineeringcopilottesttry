@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Engineering Copilot</title>
-<meta name="description" content="Four local engineering tools backed by the Groq free tier." />
+<meta name="description" content="Four local engineering tools backed by OpenRouter's free tier." />
 <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
@@ -19,7 +19,7 @@
   </div>
 
   <div class="topbar-right">
-    <div class="model-chip" id="model-chip" title="Active model (set GROQ_MODEL in .env)">
+    <div class="model-chip" id="model-chip" title="Active model (set LLM_MODEL in .env)">
       <span class="dot dot-unknown" id="status-dot"></span>
       <span id="model-name">connecting…</span>
       <span class="budget" id="token-budget" hidden></span>
@@ -110,7 +110,7 @@
 </main>
 
 <footer class="footer">
-  <span>No database · no auth · no persistence · one outbound call, to Groq</span>
+  <span>No database · no auth · no persistence · free models only · one outbound call, to OpenRouter</span>
   <span class="footer-links">
     <a href="/docs" target="_blank" rel="noopener">API docs</a>
     <a href="/api/models" target="_blank" rel="noopener">Live model list</a>

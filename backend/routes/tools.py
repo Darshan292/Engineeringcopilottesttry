@@ -25,7 +25,7 @@ from ..governance import (
     model_policy,
     token_limiter,
 )
-from ..groq_client import GroqError, list_models
+from ..llm_client import LLMError, list_models
 from ..pipeline.tools import PIPELINES, preview
 from ..samples import SAMPLES
 from ..schemas import ErrorResponse, ToolRequest, ToolResponse
@@ -80,7 +80,7 @@ async def _handle(tool: str, request: Request, body: ToolRequest, authorization:
 
     try:
         auth_policy.check(authorization)
-        model = model_policy.check_model(body.model, settings.groq_model)
+        model = model_policy.check_model(body.model, settings.model)
         temperature = model_policy.check_temperature(body.temperature)
         enforce_rate_limit(_client_key(request))
     except GovernanceError as exc:
@@ -108,7 +108,7 @@ async def _handle(tool: str, request: Request, body: ToolRequest, authorization:
         # Not an error in the pipeline: a deliberate refusal to spend money.
         log.warning("rid=%s tool=%s refused on billing: %s", request_id, tool, exc.message)
         return _error(exc.message, exc.status, exc.hint, request_id)
-    except GroqError as exc:
+    except LLMError as exc:
         log.warning("rid=%s tool=%s failed: %s", request_id, tool, exc.message)
         return _error(exc.message, exc.status, exc.hint, request_id)
     except Exception as exc:  # pragma: no cover - last-resort guard
@@ -185,7 +185,7 @@ async def plan(tool_id: str, request: Request, body: ToolRequest, authorization:
 
     try:
         auth_policy.check(authorization)
-        model = model_policy.check_model(body.model, settings.groq_model)
+        model = model_policy.check_model(body.model, settings.model)
         # Planning is local work, so it does not spend the token allowance --
         # but it is not free CPU, and an unlimited planning endpoint is a way to
         # burn the process without ever touching the provider.
@@ -197,7 +197,7 @@ async def plan(tool_id: str, request: Request, body: ToolRequest, authorization:
         result = await preview(tool_id, body.input, model=model, request_id=request_id)
     except BillingRefused as exc:
         return _error(exc.message, exc.status, exc.hint, request_id)
-    except GroqError as exc:
+    except LLMError as exc:
         return _error(exc.message, exc.status, exc.hint, request_id)
     except Exception as exc:  # pragma: no cover - last-resort guard
         log.exception("rid=%s tool=%s preview failed", request_id, tool_id)
@@ -240,10 +240,14 @@ async def config(request: Request):
 
 @router.get("/models")
 async def models():
-    """Live model list from Groq. The only trustworthy source -- model IDs churn."""
+    """Live model list from the provider. The only trustworthy source -- IDs churn.
+
+    Also what the billing guard checks prices against, so it is load-bearing
+    rather than informational.
+    """
     try:
-        return {"models": await list_models(), "configured": settings.groq_model}
-    except GroqError as exc:
+        return {"models": await list_models(), "configured": settings.model}
+    except LLMError as exc:
         return _error(exc.message, exc.status, exc.hint, "n/a")
 
 

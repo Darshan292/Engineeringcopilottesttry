@@ -6,9 +6,10 @@ provider says "come back later", what it rations, what it calls a context
 window. Those are the things this file pins, because each one has a failure mode
 that is silent or absurd rather than obvious.
 
-The worst of them is the reset header. Groq states a duration; OpenRouter states
-a Unix millisecond timestamp. Reading the second as the first is a sleep of
-roughly fifty thousand years, and nothing about the code would look wrong.
+The worst of them is the reset header. Some providers state a duration;
+OpenRouter states a Unix millisecond timestamp. Reading the second as the first
+is a sleep of roughly fifty thousand years, and nothing about the code would
+look wrong.
 """
 
 from __future__ import annotations
@@ -20,12 +21,11 @@ import time
 import httpx
 import pytest
 
-from backend import groq_client
+from backend import llm_client
 from backend.billing import price_check
-from backend.groq_client import GroqError, complete
+from backend.llm_client import LLMError, complete
 from backend.providers import (
     GENERIC,
-    GROQ,
     OPENROUTER,
     detect_provider,
     seconds_until_reset,
@@ -95,7 +95,7 @@ def test_a_reset_already_in_the_past_is_zero_not_negative():
     "url, expected",
     [
         ("https://openrouter.ai/api/v1", OPENROUTER),
-        ("https://api.groq.com/openai/v1", GROQ),
+        ("https://sub.openrouter.ai/api/v1", OPENROUTER),
         ("http://127.0.0.1:11434/v1", GENERIC),
         ("https://some-vendor.example.com/v1", GENERIC),
     ],
@@ -106,24 +106,39 @@ def test_the_provider_is_inferred_from_the_endpoint(url, expected, monkeypatch):
 
 
 def test_an_explicit_provider_wins_over_the_url(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
-    assert detect_provider("https://api.groq.com/openai/v1") is OPENROUTER
+    monkeypatch.setenv("LLM_PROVIDER", "generic")
+    assert detect_provider("https://openrouter.ai/api/v1") is GENERIC
 
 
-def test_an_unknown_endpoint_is_not_assumed_to_be_groq(monkeypatch):
-    """Guessing Groq's rules for someone else's endpoint is how the margins bite."""
+def test_an_unknown_endpoint_gets_the_conservative_profile(monkeypatch):
+    """Applying OpenRouter's rules to someone else's endpoint is how margins bite."""
     monkeypatch.delenv("LLM_PROVIDER", raising=False)
     assert detect_provider("https://llm.internal.example/v1").name == "generic"
+
+
+def test_openrouter_is_the_default_when_nothing_is_configured(monkeypatch):
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    for name in ("LLM_BASE_URL", "OPENAI_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    assert detect_provider().name == "openrouter"
 
 
 # --- what each provider rations -------------------------------------------
 
 
-def test_openrouter_rations_requests_and_groq_rations_tokens():
-    """Budgeting the wrong one produces refusals unrelated to the real limit."""
+def test_openrouter_rations_requests_not_tokens():
+    """Budgeting the wrong one produces refusals unrelated to the real limit.
+
+    OpenRouter's free tier states no token ceiling at all: what runs out is
+    requests, 20 a minute and as few as 50 a day. Budgeting it against a token
+    allowance would refuse inputs that the provider would happily have served.
+    """
     assert OPENROUTER.default_tokens_per_minute == 0, "OpenRouter states no token ceiling"
-    assert OPENROUTER.default_requests_per_day < GROQ.default_requests_per_day
-    assert GROQ.default_tokens_per_minute > 0
+    assert OPENROUTER.default_tokens_per_day == 0
+    assert OPENROUTER.default_requests_per_minute > 0
+    assert OPENROUTER.default_requests_per_day > 0
+    # The daily figure is the conservative one, for an account with no credit.
+    assert OPENROUTER.default_requests_per_day <= 50
 
 
 def test_a_provider_without_a_token_ceiling_uses_the_whole_context_window():
@@ -151,7 +166,7 @@ def test_a_provider_without_a_token_ceiling_uses_the_whole_context_window():
     ],
 )
 def test_a_context_window_is_found_under_any_provider_s_name(entry, expected):
-    assert groq_client._context_length_of(entry) == expected
+    assert llm_client._context_length_of(entry) == expected
 
 
 @pytest.mark.parametrize(
@@ -217,12 +232,12 @@ def openrouter(monkeypatch, patch_settings):
 
         monkeypatch.setenv("LLM_PROVIDER", "openrouter")
         monkeypatch.setattr(
-            groq_client, "_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            llm_client, "_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
         )
         patch_settings(
-            groq_api_key="test-key",
-            groq_base_url="https://openrouter.ai/api/v1",
-            groq_model="deepseek/deepseek-chat:free",
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="deepseek/deepseek-chat:free",
         )
         return calls
 
@@ -236,7 +251,7 @@ def no_real_sleep(monkeypatch):
     async def fake_sleep(seconds):
         slept.append(seconds)
 
-    monkeypatch.setattr(groq_client, "_sleep", fake_sleep)
+    monkeypatch.setattr(llm_client, "_sleep", fake_sleep)
     return slept
 
 
@@ -282,7 +297,7 @@ def test_a_429_reset_header_is_honoured_as_an_instant(openrouter, no_real_sleep)
 def test_blind_retries_back_off_rather_than_hammering(openrouter, no_real_sleep):
     openrouter([(429, OPENROUTER_429, None)])
 
-    with pytest.raises(GroqError):
+    with pytest.raises(LLMError):
         asyncio.run(complete("sys", "user", max_tokens=100, max_wait_seconds=200))
 
     assert len(no_real_sleep) > 1
@@ -293,12 +308,12 @@ def test_a_missing_model_is_refused_before_the_request(openrouter, no_real_sleep
     """An empty model on the wire is someone else's confusing error."""
     calls = openrouter([(200, GOOD_BODY, None)])
     patch_settings(
-        groq_api_key="test-key",
-        groq_base_url="https://openrouter.ai/api/v1",
-        groq_model="",
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        model="",
     )
 
-    with pytest.raises(GroqError) as exc:
+    with pytest.raises(LLMError) as exc:
         asyncio.run(complete("sys", "user", max_tokens=100))
 
     assert calls == [], "a request went out with no model set"

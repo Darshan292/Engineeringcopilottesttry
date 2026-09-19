@@ -19,13 +19,19 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from backend import groq_client
+from backend import llm_client
 from backend import main as main_module
 from backend.main import app
 from backend.pipeline import base as pipeline_base
 from backend.routes import tools as tools_route
 
 TOOL_IDS = ["unit-tests", "api-docs", "log-rca", "postmortem"]
+
+# A stand-in for "a real chat model with a large window". Free-looking on
+# purpose: the billing guard is active in tests too, and a model that does not
+# read as free would be refused before anything interesting happened.
+TEST_MODEL = "test/chat-model:free"
+TEST_MODEL_WINDOW = 131_072
 
 
 VALID_RESPONSES: dict[str, dict] = {
@@ -216,18 +222,55 @@ def client() -> TestClient:
     return TestClient(app)
 
 
+def _install_settings(monkeypatch, replaced):
+    """Point every reader at the same replacement object.
+
+    `backend.config` is included because `pipeline.tools` imports settings
+    inside the function that uses it, so it re-reads the module attribute on
+    every call and never sees a patch applied only to the aliases.
+    """
+    from backend import config as config_module
+
+    monkeypatch.setattr(config_module, "settings", replaced)
+    monkeypatch.setattr(llm_client, "settings", replaced)
+    monkeypatch.setattr(tools_route, "settings", replaced)
+    monkeypatch.setattr(main_module, "settings", replaced)
+    return replaced
+
+
 @pytest.fixture
 def patch_settings(monkeypatch):
     """Settings is a frozen dataclass, so swap the whole object, not a field."""
 
     def _apply(**overrides):
-        replaced = dataclasses.replace(groq_client.settings, **overrides)
-        monkeypatch.setattr(groq_client, "settings", replaced)
-        monkeypatch.setattr(tools_route, "settings", replaced)
-        monkeypatch.setattr(main_module, "settings", replaced)
-        return replaced
+        return _install_settings(
+            monkeypatch, dataclasses.replace(llm_client.settings, **overrides)
+        )
 
     return _apply
+
+
+@pytest.fixture(autouse=True)
+def known_test_model(monkeypatch):
+    """Give the window table one entry, since it no longer ships any.
+
+    Context windows come from the provider's live catalogue now, so the
+    compiled-in table is deliberately empty -- a copy of someone else's model
+    list could only go stale. Tests still need a model whose window is a known
+    quantity, so they declare one rather than leaning on data the application
+    no longer carries.
+    """
+    from backend.core import tokens
+
+    monkeypatch.setitem(tokens.CONTEXT_WINDOWS, TEST_MODEL, TEST_MODEL_WINDOW)
+    monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
+
+    # And point the application at it. Registering the window without selecting
+    # the model left the suite running on the unset-model fallback -- a
+    # conservative 8,192-token window -- so budget-sensitive tests were
+    # exercising the degraded path and asserting against it. A test for the
+    # unset case sets `model=""` explicitly instead.
+    _install_settings(monkeypatch, dataclasses.replace(llm_client.settings, model=TEST_MODEL))
 
 
 @pytest.fixture
@@ -243,7 +286,7 @@ def shrink_window(monkeypatch):
     from backend.core import tokens
 
     def apply(window: int, model: str | None = None) -> str:
-        target = model or live_settings.groq_model
+        target = model or live_settings.model
         monkeypatch.setitem(tokens.CONTEXT_WINDOWS, target, window)
         # A cached provider window would override the table.
         monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
@@ -265,7 +308,7 @@ def no_network_metadata_refresh(monkeypatch):
         return False
 
     monkeypatch.setattr("backend.pipeline.tools.refresh_model_registry_if_stale", _no_refresh, raising=False)
-    monkeypatch.setattr("backend.groq_client.refresh_model_registry_if_stale", _no_refresh)
+    monkeypatch.setattr("backend.llm_client.refresh_model_registry_if_stale", _no_refresh)
 
 
 @pytest.fixture(autouse=True)
@@ -287,19 +330,19 @@ def reset_process_state():
     # latches permanently once a charge is seen. Both are correct in production
     # and would make the suite order-dependent, so each test starts from a fresh
     # guard holding a catalogue shaped like the default provider's: models with
-    # no pricing block, as Groq publishes. That keeps the guard switched ON for
+    # no pricing block. That keeps the guard switched ON for
     # every test -- a regression that refuses legitimate calls still fails here
     # -- while `test_free_tier_guard.py` installs a priced catalogue of its own
     # to exercise the strict path.
     import backend.billing as billing_module
-    import backend.groq_client as groq_module
+    import backend.llm_client as client_module
 
     fresh_guard = FreeTierGuard()
     fresh_guard.load_catalogue([{"id": "test-catalogue-placeholder"}])
     billing_module.guard = fresh_guard
-    groq_module.guard = fresh_guard
+    client_module.guard = fresh_guard
 
-    # The token budget defaults to the Groq free tier's 8,000/minute, which a
+    # The token budget may default to a token-rationed tier's 8,000/minute, which a
     # multi-call test legitimately exceeds. Tests get an effectively unlimited
     # budget; `test_api.py` exercises the real ceiling explicitly.
     token_limiter.per_minute = 10_000_000

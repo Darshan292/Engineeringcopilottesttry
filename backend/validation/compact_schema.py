@@ -8,7 +8,7 @@ dozen tokens saying what `"summary": string` says in three, and `$defs` with
 shape it must produce.
 
 That matters because the free tier's binding constraint is tokens per minute,
-not requests per minute. On Groq's 8,000 TPM ceiling a 3,600-token system
+not requests per minute. On an 8,000 TPM ceiling a 3,600-token system
 prompt means a single repair attempt can exhaust a minute's budget, and the
 user sees a 429 that looks like the app is broken.
 

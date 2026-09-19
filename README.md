@@ -2,7 +2,8 @@
 
 Four internal engineering tools in one local web app. FastAPI backend, plain
 HTML + vanilla JS frontend, no build step. Everything is free and open source;
-the only outbound call is to the Groq API on its free tier.
+the only outbound call is to OpenRouter's free tier, and the app refuses to
+make a call it has not first proven costs nothing.
 
 The point of the design: **the LLM is one stage in a pipeline, not the pipeline.**
 Input is redacted, classified and parsed before it reaches the model, and
@@ -24,13 +25,25 @@ Each tool has a **Load sample** button with a realistic input.
 
 ```bash
 cp .env.example .env
-# paste a free key into .env:
-#   Groq        https://console.groq.com/keys
-#   OpenRouter  https://openrouter.ai/settings/keys   (also set LLM_PROVIDER=openrouter)
+# paste a free key into .env -- https://openrouter.ai/settings/keys
+# no credit card required, and a $0 balance is enough for the free models
 
 .venv/bin/python scripts/list_models.py --free   # what your key can actually call
+# copy one of those ids into LLM_MODEL in .env, then:
+
+.venv/bin/python scripts/preflight.py            # prove it works and costs nothing
 ./run.sh
 ```
+
+`preflight.py` is worth running once. It checks the key, loads the catalogue,
+confirms your model is priced at zero, then makes **one real call** and asserts
+the provider billed it at nothing. It spends one request out of your daily 50;
+`--no-call` skips that and checks configuration only.
+
+It matters more than a usual smoke test here: `openrouter.ai` was unreachable
+from the environment this was built in, so the live API path is the one part
+that was never exercised during development. See
+[Honest limits](ARCHITECTURE.md#honest-limits).
 
 Open <http://127.0.0.1:8000>.
 
@@ -40,42 +53,40 @@ all MIT/BSD/Apache-2.0.
 
 ---
 
-## Providers
+## OpenRouter, and only free models
 
-Groq and OpenRouter both work, as does any other OpenAI-compatible endpoint
-(Ollama, llama.cpp, vLLM, LM Studio). Pick one in `.env`:
+The target is OpenRouter's free tier. Any other OpenAI-compatible endpoint also
+works — Ollama, llama.cpp, vLLM, LM Studio — because the client speaks the same
+wire format, but OpenRouter is the one the guards are built around.
 
 ```bash
-# Groq (default)
-GROQ_API_KEY=gsk_...
-LLM_MODEL=openai/gpt-oss-120b
-
-# OpenRouter
-LLM_PROVIDER=openrouter
 OPENROUTER_API_KEY=sk-or-v1-...
-LLM_MODEL=              # pick one — see below
+LLM_MODEL=              # pick one -- see below
 ```
 
-**Do not trust any model list written in this repository.** Catalogues turn
-over fast. Ask your own key instead:
+**Do not trust any model list written in this repository.** Free variants appear
+and vanish as providers donate and withdraw capacity, so nothing is compiled in.
+Ask your own key instead:
 
 ```bash
 .venv/bin/python scripts/list_models.py --free
 ```
 
-Groq ships a default model here because its chat catalogue is short and
-slow-moving. **OpenRouter deliberately does not**: hundreds of models, and free
-variants that appear and vanish as providers donate and withdraw capacity. Any
-ID compiled in would eventually become a confusing 404, so the app asks you to
-choose and points at the live list. Being told to pick beats being told a model
-you never picked is gone.
+No default model ships, deliberately. Hundreds of models, free variants that
+come and go — any ID baked in here would eventually become a confusing 404 about
+a model you never chose. Being asked to pick beats being told your model is
+gone.
 
-### They differ in more than the URL
+`openrouter/free` is a valid choice: it routes only within free models. The
+router `openrouter/auto` is **blocked by name**, because it selects across the
+whole catalogue including paid models and no price check can see where it went.
+
+### OpenRouter is not just a different base URL
 
 This is the part that bites, and it is why `backend/providers.py` exists rather
 than a base-URL setting:
 
-| | Groq | OpenRouter (free) |
+| | Typical OpenAI-style API | OpenRouter (free) |
 |---|---|---|
 | Rations | **tokens** per minute | **requests**: 20/min, 50/day (1,000/day above $10 lifetime spend) |
 | 429 states the delay | `retry-after` + in the body | often **nothing at all** |
@@ -119,16 +130,19 @@ and selects from the whole catalogue, so no pricing check can see the cost.
 `openrouter/free` is allowed, because it routes only within free models.
 
 **One honest caveat.** Layer 1 only works where the provider publishes prices.
-Groq's model list has none — there, "free tier" is a property of your account,
-not of a model — so on Groq only layer 3 applies. `GET /api/config` reports
-which regime is actually in force under `billing.mode`, rather than implying a
-guarantee that is not being made.
+OpenRouter does, per model, which is why the guard is built around it. Point
+`LLM_BASE_URL` at an endpoint that publishes none — a local Ollama, or a
+provider where "free tier" is a property of your account rather than of a model
+— and there is nothing per-model to check, so only layer 3 applies.
+`GET /api/config` reports which regime is actually in force under
+`billing.mode`, rather than implying a guarantee that is not being made.
 
 ## Requests are the scarce resource, not tokens
 
-Groq rations tokens per minute. **OpenRouter's free tier rations requests**: 20
-a minute, and 50 a day until you have bought $10 of credit. That changes what
-"expensive" means.
+Most OpenAI-style APIs ration tokens per minute. **OpenRouter's free tier
+rations requests**: 20 a minute, and 50 a day until you have bought $10 of
+credit. That changes what "expensive" means, and it is the single most important
+difference to understand here.
 
 One browser click is one HTTP request and anything from one to thirty upstream
 calls. The provider counts the upstream ones. So the limiter counts them too,
@@ -168,45 +182,46 @@ warning rather than splitting into something slower *and* more expensive. The
 fixes there are a larger allowance or a cheaper model, and the warning names
 both.
 
-### Routing models cost about twice what they look like
+### Routing models cost more than they look like
 
-`groq/compound` and `groq/compound-mini` are agents in front of other models.
-Three consequences, all of which this app now handles explicitly:
+`openrouter/free` is a router: it picks a free model per request rather than
+being one. Routers have consequences this app handles explicitly:
 
-- The rate limit that binds is the **underlying** model's, so a 429 names a
-  model you never chose (`meta-llama/llama-4-scout-...`). The error says so.
-- The prompt on the wire carries tool schemas and internal instructions you
-  never wrote, so one call costs roughly **2.3x** the visible input. These
-  models start with that correction already applied, rather than discovering it
-  by failing.
-- On a small allowance the fixed overhead can exceed the whole minute. At
-  `TOKEN_LIMIT_PER_MINUTE=8000`, `groq/compound` leaves about **512 tokens** for
-  your input; `openai/gpt-oss-120b` leaves about **2,450**. If you are pacing
-  tightly, use a plain chat model.
+- The rate limit that binds is the **underlying** model's, so a 429 can name a
+  model you never chose. The error says so rather than leaving you to wonder.
+- The prompt on the wire carries routing and tool instructions you never wrote,
+  so a call costs more than the visible input suggests. Routers start with that
+  correction applied rather than discovering it by failing.
+- `openrouter/auto` is a different thing entirely and is **refused**: it routes
+  across the whole catalogue, paid models included, so no price check can see
+  where your request went. `openrouter/free` stays inside free models, which is
+  why it is allowed.
 
 ---
 
-## Read this before setting `GROQ_MODEL`
+## Read this before setting `LLM_MODEL`
 
-Groq's catalogue turns over fast. `llama-3.3-70b-versatile` was decommissioned
-on 2026-08-16, and `qwen/qwen3.6-27b` — the replacement this app defaulted to
-after that — has since been superseded by `qwen/qwen3.8-27b`. Both now return
-`404 model_not_found` and the error names the current replacement.
+There is no default, and that is deliberate. OpenRouter's free catalogue turns
+over constantly — variants appear when a provider donates capacity and vanish
+when they stop. Any ID written into this repository would eventually 404 for
+someone who never chose it.
 
-The default here is **`openai/gpt-oss-120b`**: of the free-tier chat models it
-is the most reliable at following a JSON schema, which is the thing this
-application asks of it on every call.
+So ask your own key what it can call:
 
-| Model | Notes |
-| --- | --- |
-| `openai/gpt-oss-120b` | **Default.** ~131K context. Most reliable at structured output. |
-| `openai/gpt-oss-20b` | Smaller and faster. |
-| `qwen/qwen3.8-27b` | ~131K context, free tier. |
-| `groq/compound`, `groq/compound-mini` | Agentic routers. Usable, but see the section above — one call costs about 2.3x the visible input, and the rate limit that binds is the underlying model's. |
+```bash
+.venv/bin/python scripts/list_models.py --free
+```
 
-Model IDs churn, so the app never trusts a baked-in list. `GET /api/models`
-returns the live list for your key, and pointing `GROQ_MODEL` at a model known
-to be retired produces an error naming the replacement.
+That prints only models whose every pricing field is zero — the same check the
+billing guard applies before each call. Copy an ID into `LLM_MODEL`.
+
+Two practical notes:
+
+- **Prefer a model that is reliable at structured output.** Every call here asks
+  for JSON against a schema, and a model that wanders costs you repair attempts,
+  which on a 50-request day is real money in requests.
+- **`openrouter/free` is a reasonable first choice** if you do not want to pick:
+  it routes only within free models and adapts as the catalogue changes.
 
 ### Not every model in that list is a chat model
 
@@ -233,7 +248,7 @@ limits from the provider's `x-ratelimit-*` response headers where they are sent,
 and falls back to `TOKEN_LIMIT_PER_MINUTE` / `TOKEN_LIMIT_PER_DAY`. Remaining
 budget is shown next to the model name in the UI.
 
-Because `GROQ_BASE_URL` is configurable and the wire format is
+Because `LLM_BASE_URL` is configurable and the wire format is
 OpenAI-compatible, this also runs against Ollama, llama.cpp, vLLM or LM Studio
 with no code changes. A loopback URL automatically bypasses any `HTTP_PROXY` in
 your environment.
@@ -358,7 +373,7 @@ body and the `X-Request-ID` header, and a per-stage timing trace.
 | `POST` | `/api/plan/{tool}` | same shape — what the run **would** do. No model call, no tokens. |
 | `GET` | `/api/tools` | tab metadata + samples (the UI builds itself from this) |
 | `GET` | `/api/config` | non-secret config, governance state, your rate-limit usage |
-| `GET` | `/api/models` | live model list from Groq |
+| `GET` | `/api/models` | live model list for your key, each marked free or not |
 | `GET` | `/api/health` | liveness + whether the key is configured |
 | `GET` | `/docs` | interactive OpenAPI docs |
 
@@ -389,8 +404,8 @@ Errors carry a remediation, not just a status code:
 
 ```json
 {
-  "error": "Model 'llama-3.3-70b-versatile' is unavailable: model_not_found",
-  "hint": "'llama-3.3-70b-versatile' is retired: Decommissioned on the Groq free/developer tier on 2026-08-16. Set LLM_MODEL=openai/gpt-oss-120b in .env and restart.",
+  "error": "Model 'some-vendor/withdrawn-model:free' is unavailable: model_not_found",
+  "hint": "OpenRouter does not serve 'some-vendor/withdrawn-model:free' on this account. Open GET /api/models to see what your key can actually call, then set LLM_MODEL in .env.",
   "request_id": "4e295766e9f1"
 }
 ```
@@ -400,7 +415,7 @@ Errors carry a remediation, not just a status code:
 ## Tests
 
 ```bash
-.venv/bin/pytest                        # 305 tests, no network, no key, no cost
+.venv/bin/pytest                        # 331 tests, no network, no key, no cost
 node --test tests/markdown.test.mjs     # 22 renderer tests including XSS
 ```
 
@@ -421,15 +436,19 @@ tests could not see it:
 - `test_rate_limit_recovery.py` proves a 429 is waited out and retried rather
   than surfaced, that a configured token limit is never raised by the provider,
   and that the limit and real per-call cost stated in a 429 body are adopted.
-- `test_providers.py` proves the things Groq and OpenRouter disagree about — in
-  particular that a Unix-millisecond reset instant is never read as a duration,
-  even if the provider profile's flag is wrong.
+- `test_free_tier_guard.py` proves the three billing layers, including that the
+  model list never labels a model free that the guard would refuse — the two
+  used to disagree for exactly the router that made it dangerous.
+- `test_providers.py` proves the things OpenRouter does differently from a
+  typical OpenAI-style API — in particular that its Unix-millisecond reset
+  instant is never read as a duration, even if the provider profile's flag is
+  wrong.
 
 **These prove the system behaves correctly. They say nothing about whether the
 model's analysis is any good.** That needs a real model:
 
 ```bash
-export GROQ_API_KEY=...
+export OPENROUTER_API_KEY=...
 python -m evals.run                  # 5 golden cases, 31 checks, 9 critical
 python -m evals.run --repeat 3       # exposes non-determinism
 python -m evals.run --model openai/gpt-oss-120b --verbose

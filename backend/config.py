@@ -23,64 +23,38 @@ load_dotenv(REPO_ROOT / ".env", override=False)
 # ---------------------------------------------------------------------------
 # Model defaults
 #
-# Checked against Groq's published model/deprecation list at build time
-# (2026-09-18). `llama-3.3-70b-versatile` -- the historical default for this
-# kind of app -- was deprecated for free/developer tiers on 2026-06-17 and
-# decommissioned on 2026-08-16. Requesting it now returns 404 model_not_found.
-# Groq's own recommended replacements are the two listed below.
+# There is deliberately no default model.
 #
-# These are hints for humans and for the /api/models fallback only; the app
-# never hard-blocks a model name. Whatever GROQ_MODEL says is what gets sent.
+# OpenRouter's catalogue is hundreds of models deep, and the free variants are
+# the most volatile part of it: providers donate capacity and withdraw it, and a
+# `:free` suffix that resolves today can 404 next week. Any id compiled in here
+# would be a guess that eventually becomes a confusing failure for someone who
+# never chose it. Being asked to pick beats being told a model you never picked
+# is gone, so the app points at the live list instead -- which is also the list
+# the billing guard checks prices against.
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = "openai/gpt-oss-120b"
-
-# A default is only offered where this application can name a model with some
-# confidence that it exists. Groq's chat catalogue is short and slow-moving, so
-# a default there is a reasonable convenience.
-#
-# OpenRouter's is neither: hundreds of models, free variants that appear and
-# disappear as providers donate and withdraw capacity, and a `:free` suffix
-# whose availability changes week to week. Any id compiled in here would be a
-# guess that eventually becomes a confusing 404, so there is deliberately no
-# default -- the app asks you to pick one and points at the live list to pick
-# from. Being told to choose beats being told a model you never chose is gone.
 DEFAULT_MODELS: dict[str, str] = {
-    "groq": DEFAULT_MODEL,
     "openrouter": "",
     "generic": "",
 }
 
-KNOWN_FREE_TIER_MODELS: tuple[dict[str, str], ...] = (
-    {
-        "id": "openai/gpt-oss-120b",
-        "note": "Default. ~131K context and the most reliable of these at following a JSON schema.",
-    },
-    {
-        "id": "openai/gpt-oss-20b",
-        "note": "Smaller and faster sibling. Good when you want snappier turnaround.",
-    },
-    {
-        "id": "qwen/qwen3.8-27b",
-        "note": "Alibaba's open-weight model on the free tier. ~131K context.",
-    },
-)
+# Model ids that are known to be gone, so the failure names the cause rather
+# than surfacing a bare 404. Populated from experience rather than compiled
+# from a vendor list, because the live catalogue is the source of truth.
+RETIRED_MODELS: dict[str, str] = {}
 
-RETIRED_MODELS: dict[str, str] = {
-    "llama-3.3-70b-versatile": "Decommissioned on the Groq free/developer tier on 2026-08-16.",
-    "llama-3.1-8b-instant": "Deprecated alongside llama-3.3-70b-versatile on 2026-06-17.",
-    "qwen/qwen3.6-27b": "Superseded by qwen/qwen3.8-27b and no longer served.",
-    "mixtral-8x7b-32768": "Long retired.",
-    "llama3-70b-8192": "Long retired.",
-    "llama3-8b-8192": "Long retired.",
-}
-
-# Models that are a router or an agent in front of other models rather than a
-# model themselves. They matter for budgeting: the rate limit that binds is the
-# underlying model's, the 429 names a model the caller never chose, and the
-# prompt on the wire carries tool schemas and internal instructions that the
-# text we sent gives no hint of -- so a token estimate built from our own
-# messages understates the real cost, on Groq's compound models by roughly 2x.
-ROUTING_MODELS: frozenset[str] = frozenset({"groq/compound", "groq/compound-mini"})
+# Models that are a router in front of other models rather than a model
+# themselves. They matter for budgeting: the rate limit that binds is the
+# underlying model's, a 429 names a model the caller never chose, and the prompt
+# on the wire carries routing instructions the text we sent gives no hint of --
+# so a token estimate built from our own messages understates the real cost.
+#
+# `openrouter/free` is here because it dispatches across free models. It is
+# still safe to use: it only ever selects from models priced at zero, which is
+# exactly what the billing guard requires. `openrouter/auto` is deliberately
+# NOT here -- it is blocked outright in `billing.py`, because it selects from
+# the entire catalogue and no price check can see its choice in advance.
+ROUTING_MODELS: frozenset[str] = frozenset({"openrouter/free"})
 
 
 def is_routing_model(model: str) -> bool:
@@ -120,7 +94,7 @@ MAP_OUTPUT_TOKENS = 1_200
 def output_tokens_for(tool: str, *, is_map_step: bool = False) -> int:
     if is_map_step:
         return MAP_OUTPUT_TOKENS
-    configured = os.getenv("GROQ_MAX_TOKENS")
+    configured = os.getenv("LLM_MAX_TOKENS")
     if configured and configured.strip().isdigit():
         return int(configured)
     return TOOL_OUTPUT_TOKENS.get(tool, 2_600)
@@ -139,11 +113,11 @@ def _env_int(name: str, default: int) -> int:
 def _resolve_model() -> str:
     """The model to call, under any of the accepted variable names.
 
-    `LLM_MODEL` is the current name; `GROQ_MODEL` is kept because every existing
+    `LLM_MODEL` is the current name; `LLM_MODEL` is kept because every existing
     .env uses it. The per-provider default only applies where this application
     can name a model that is actually likely to exist -- see `DEFAULT_MODELS`.
     """
-    for name in ("LLM_MODEL", "GROQ_MODEL"):
+    for name in ("LLM_MODEL", "LLM_MODEL"):
         raw = os.getenv(name)
         if raw and raw.strip():
             return raw.strip()
@@ -153,35 +127,35 @@ def _resolve_model() -> str:
 @dataclass(frozen=True)
 class Settings:
     provider: str = field(default_factory=lambda: detect_provider().name)
-    groq_api_key: str = field(default_factory=lambda: resolve_api_key(detect_provider()))
-    groq_model: str = field(default_factory=_resolve_model)
-    groq_base_url: str = field(
+    api_key: str = field(default_factory=lambda: resolve_api_key(detect_provider()))
+    model: str = field(default_factory=_resolve_model)
+    base_url: str = field(
         default_factory=lambda: resolve_base_url(detect_provider())
     )
-    temperature: float = field(default_factory=lambda: _env_float("GROQ_TEMPERATURE", 0.2))
-    max_tokens: int = field(default_factory=lambda: _env_int("GROQ_MAX_TOKENS", 4096))
+    temperature: float = field(default_factory=lambda: _env_float("LLM_TEMPERATURE", 0.2))
+    max_tokens: int = field(default_factory=lambda: _env_int("LLM_MAX_TOKENS", 4096))
     timeout_seconds: float = field(
-        default_factory=lambda: _env_float("GROQ_TIMEOUT_SECONDS", 120.0)
+        default_factory=lambda: _env_float("LLM_TIMEOUT_SECONDS", 120.0)
     )
     host: str = field(default_factory=lambda: os.getenv("HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: _env_int("PORT", 8000))
 
     @property
     def has_api_key(self) -> bool:
-        return bool(self.groq_api_key)
+        return bool(self.api_key)
 
     @property
     def model_warning(self) -> str | None:
         """Warn loudly if the configured model is missing or known to be dead."""
-        provider = detect_provider(self.groq_base_url)
-        if not self.groq_model:
+        provider = detect_provider(self.base_url)
+        if not self.model:
             return (
                 f"No model is configured. {provider.label} has no default here because its "
                 f"catalogue changes too often for any id compiled into this application to "
                 f"stay true. Set LLM_MODEL in your .env -- GET /api/models lists what your key "
                 f"can actually call right now, with the free ones marked."
             )
-        reason = RETIRED_MODELS.get(self.groq_model)
+        reason = RETIRED_MODELS.get(self.model)
         if reason:
             replacement = DEFAULT_MODELS.get(provider.name)
             fix = (
@@ -190,7 +164,7 @@ class Settings:
                 else "Pick another from GET /api/models and set LLM_MODEL in your .env."
             )
             return (
-                f"LLM_MODEL is set to '{self.groq_model}', which is retired. {reason} "
+                f"LLM_MODEL is set to '{self.model}', which is retired. {reason} "
                 f"Requests will fail with 404 model_not_found. {fix}"
             )
         return None
@@ -205,18 +179,14 @@ class Settings:
         """Safe-to-serve view. Deliberately contains no key material."""
         return {
             "test_execution_enabled": self.test_execution_enabled,
-            "model": self.groq_model,
-            "base_url": self.groq_base_url,
+            "model": self.model,
+            "base_url": self.base_url,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "timeout_seconds": self.timeout_seconds,
             "api_key_configured": self.has_api_key,
             "model_warning": self.model_warning,
-            "provider": detect_provider(self.groq_base_url).public(),
-            # Only meaningful for a provider this app ships a short list for.
-            "known_free_tier_models": (
-                list(KNOWN_FREE_TIER_MODELS) if self.provider == "groq" else []
-            ),
+            "provider": detect_provider(self.base_url).public(),
         }
 
 

@@ -6,7 +6,7 @@
     python -m evals.run --case rca-cascade --verbose
     python -m evals.run --json results.json
 
-Unlike `tests/`, this costs real API calls and needs `GROQ_API_KEY`. It is the
+Unlike `tests/`, this costs real API calls and needs `OPENROUTER_API_KEY`. It is the
 only thing here that measures the model's analytical quality rather than the
 system's plumbing, and it is the answer to "how do you know the output is any
 good?"
@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from backend.groq_client import GroqError  # noqa: E402
+from backend.llm_client import LLMError  # noqa: E402
 from backend.pipeline.tools import PIPELINES  # noqa: E402
 from evals.cases import ALL_CASES, EvalCase  # noqa: E402
 
@@ -78,7 +78,7 @@ async def run_case(case: EvalCase, model: str | None) -> RunResult:
     started = time.perf_counter()
     try:
         result = await PIPELINES[case.tool](case.input, model=model, request_id=f"eval-{case.id}")
-    except GroqError as exc:
+    except LLMError as exc:
         return RunResult(
             case_id=case.id, tool=case.tool, ok=False, error=f"{exc.message}",
             elapsed_ms=int((time.perf_counter() - started) * 1000),
@@ -129,7 +129,7 @@ def print_run(result: RunResult, verbose: bool) -> None:
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description="Run golden evals against a real model.")
-    parser.add_argument("--model", help="Override GROQ_MODEL for this run.")
+    parser.add_argument("--model", help="Override LLM_MODEL for this run.")
     parser.add_argument("--repeat", type=int, default=1, help="Runs per case; exposes non-determinism.")
     parser.add_argument("--case", action="append", help="Run only these case IDs.")
     parser.add_argument("--tool", action="append", help="Run only these tools.")
@@ -138,9 +138,9 @@ async def main() -> int:
     parser.add_argument("--save-outputs", help="Directory to write each generated document into.")
     args = parser.parse_args()
 
-    if not os.getenv("GROQ_API_KEY"):
-        print(f"{RED}GROQ_API_KEY is not set.{RESET} These evals make real API calls.")
-        print("Get a free key at https://console.groq.com/keys, then: export GROQ_API_KEY=...")
+    if not os.getenv("OPENROUTER_API_KEY"):
+        print(f"{RED}OPENROUTER_API_KEY is not set.{RESET} These evals make real API calls.")
+        print("Get a free key at https://openrouter.ai/settings/keys, then: export OPENROUTER_API_KEY=...")
         return 2
 
     cases = ALL_CASES
@@ -152,7 +152,7 @@ async def main() -> int:
         print("No cases matched the filters.")
         return 2
 
-    model = args.model or os.getenv("GROQ_MODEL") or "(configured default)"
+    model = args.model or os.getenv("LLM_MODEL") or "(configured default)"
     total_calls = len(cases) * args.repeat
     print(f"{BOLD}Golden evaluation{RESET}")
     print(f"  model:  {model}")

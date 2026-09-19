@@ -32,7 +32,7 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from ..core.tokens import estimate_messages_tokens
-from ..groq_client import GroqError, complete
+from ..llm_client import LLMError, complete
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -341,7 +341,7 @@ async def call_structured(
                     feedback = "\n\n".join(domain_errors)
 
         if attempt > MAX_REPAIR_ATTEMPTS:
-            raise GroqError(
+            raise LLMError(
                 f"The model did not produce a valid response after {attempt} attempts. "
                 f"Last problem: {feedback.splitlines()[0][:200]}",
                 status=502,

@@ -25,7 +25,7 @@ pip install --quiet -r requirements.txt
 if [ ! -f .env ]; then
   echo
   echo "!! No .env found."
-  echo "!! Run: cp .env.example .env    then paste a free key from https://console.groq.com/keys"
+  echo "!! Run: cp .env.example .env    then paste a free key from https://openrouter.ai/settings/keys"
   echo "!! Starting anyway -- the UI will tell you the same thing."
   echo
 fi

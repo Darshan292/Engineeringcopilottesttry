@@ -263,11 +263,36 @@ def _skeleton_for(ir) -> str:
     return ""
 
 
-# A map-reduce plan costs one upstream call per chunk plus one to combine.
-# The Groq free tier allows roughly 30 requests/minute and 1,000/day, so a plan
-# with hundreds of chunks would exhaust a day's quota on a single request. The
-# cap makes that a refusal with a stated remedy instead of a silent bill.
+# A map-reduce plan costs one upstream call per chunk plus the combine tree, so
+# on a request-rationed tier the parts are not the scarce thing -- the calls
+# are. OpenRouter's free tier allows 20 requests a minute and as few as 50 a
+# day, which makes this cap load-bearing in a way it never was against a
+# token-rationed provider: a forty-part plan is eighty per cent of a day's
+# entire allowance spent on one paste.
+#
+# So the absolute ceiling below is only half the rule. `max_chunks_for_budget`
+# narrows it to a share of what the caller has left today, which is the figure
+# that actually matters, and the planner reports the arithmetic when it bites.
 DEFAULT_MAX_CHUNKS = 40
+
+# The most of a day's remaining request allowance one request may consume.
+# Spending it all on a single paste leaves nothing for the rest of the day, and
+# whoever pasted it almost certainly did not intend that.
+MAX_DAILY_SHARE_PER_REQUEST = 0.5
+
+
+def max_chunks_for_budget(remaining_requests_today: int | None = None) -> int:
+    """The chunk cap that this caller's remaining daily allowance permits.
+
+    Returns the absolute ceiling when the provider does not ration requests, or
+    when the remaining allowance is unknown.
+    """
+    if remaining_requests_today is None or remaining_requests_today <= 0:
+        return DEFAULT_MAX_CHUNKS
+    # Each chunk is one call and the combine tree adds more, so leave headroom
+    # rather than budgeting the parts alone and overshooting on the combine.
+    affordable = int(remaining_requests_today * MAX_DAILY_SHARE_PER_REQUEST) - 1
+    return max(1, min(DEFAULT_MAX_CHUNKS, affordable))
 
 
 def _pacing_seconds(calls: int, tokens_per_call: int, allowance_per_minute: int) -> int:
@@ -376,7 +401,12 @@ def plan_context(
     """
     # Resolved at call time, not captured as a default, so the module-level
     # values stay overridable by configuration and by tests.
-    max_chunks = DEFAULT_MAX_CHUNKS if max_chunks is None else max_chunks
+    # The cap is what today's allowance can afford, not a constant. Refusing a
+    # plan that would exceed the remaining calls is necessary but not
+    # sufficient: a plan that spends every remaining call is technically
+    # affordable and still leaves nothing for the rest of the day.
+    if max_chunks is None:
+        max_chunks = max_chunks_for_budget(calls_remaining_today)
     max_plan_seconds = MAX_PLAN_SECONDS if max_plan_seconds is None else max_plan_seconds
     skeleton = _skeleton_for(ir)
 

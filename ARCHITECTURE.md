@@ -134,10 +134,12 @@ succeeding and a repair attempt exhausting the minute's allowance. The compact
 rendering is ~63% smaller and pydantic still enforces the real contract after
 the response arrives.
 
-**The rate limiter counts tokens, not requests.** Requests per minute is easy to
-model and the wrong constraint. Groq's free tier allows 30 requests/min but
-8,000 tokens/min for a chat model, and this application's requests are large, so
-the token ceiling binds first. Counting requests meant repair attempts were sent
+**The rate limiter counts whichever the provider actually rations.** Requests
+per minute is the easy thing to model and often the wrong constraint: a
+token-rationed API may allow 30 requests/min but only 8,000 tokens/min, and this
+application's requests are large, so the token ceiling binds first. OpenRouter's
+free tier is the opposite — it rations requests and publishes no token ceiling
+— so both are tracked and the binding one is whichever the provider states. Counting requests meant repair attempts were sent
 into a budget already spent, and the caller got an upstream 429 naming a limit
 the application had never heard of. The budget is now tracked locally, checked
 before every attempt including repairs, and adopted from the provider's
@@ -209,13 +211,13 @@ being wrong is silent.
 
 Three of them matter enough to name:
 
-**What they ration.** Groq's free tier binds on tokens per minute. OpenRouter's
-binds on requests — per minute and per day — and reports no token ceiling at
-all. The whole budgeting layer is built around a token allowance, so a
+**What they ration.** A typical OpenAI-style API binds on tokens per minute.
+OpenRouter's free tier binds on requests — 20 per minute, 50 per day below $10
+of lifetime credit — and reports no token ceiling at all. The whole budgeting layer is built around a token allowance, so a
 request-rationed provider has to be able to say "not rationed" and get the
 model's full context window. Zero means exactly that; it does not mean zero.
 
-**How they say "come back later".** Groq sends `retry-after` and repeats the
+**How they say "come back later".** Most APIs send `retry-after` and repeat the
 delay in the error body. OpenRouter's free-tier per-minute 429 sends neither,
 and states when the window reopens as `X-RateLimit-Reset`: a Unix timestamp in
 milliseconds. Two failure modes follow. Treating a missing delay as "give up"
@@ -230,10 +232,10 @@ nested under `top_provider`. Accepted liberally, because the alternative is
 every model reporting an unknown window and the planner falling back to a
 conservative 8,192 for a model with 163,840.
 
-Selection is `LLM_PROVIDER`, else inferred from the base URL's host, else Groq
-for the .env files that already exist. An unrecognised endpoint gets a
-conservative generic profile rather than Groq's rules, because assuming one
-vendor's margins for another is the mistake this module exists to stop.
+Selection is `LLM_PROVIDER`, else inferred from the base URL's host, else
+OpenRouter. An unrecognised endpoint gets a conservative generic profile rather
+than OpenRouter's rules, because assuming one vendor's margins for another is
+the mistake this module exists to stop.
 
 ## Rate limits, and why they are not errors
 
@@ -279,9 +281,9 @@ for "one call is larger than one minute's allowance", and treating the two as
 the same problem costs real quota: each part re-sends the system prompt and
 re-reserves the output, so N parts cost about N times that fixed overhead.
 
-When the fixed overhead already dominates — at `TOKEN_LIMIT_PER_MINUTE=8000`,
-`groq/compound` leaves roughly 512 tokens per call for actual input against
-`openai/gpt-oss-120b`'s 2,450 — the app says so in a warning rather than
+When the fixed overhead already dominates — a routing model on a tight token
+allowance can leave only a few hundred tokens per call for actual input, where a
+plain chat model leaves thousands — the app says so in a warning rather than
 splitting into something both slower and more expensive. The only real remedies
 are a larger allowance or a cheaper model, and the warning names both.
 
@@ -319,11 +321,15 @@ These are real and not papered over:
   published documentation rather than from a call made by this code —
   `openrouter.ai` is unreachable from the environment this was built in. They
   are defaults, overridable by `RATE_LIMIT_PER_MINUTE`/`RATE_LIMIT_PER_DAY`, and
-  the reset parser tolerates being wrong about the units. `scripts/list_models.py`
-  checks the rest against a real key in one command.
+  the reset parser tolerates being wrong about the units.
+  `scripts/preflight.py` checks the rest against a real key in one command: it
+  loads the catalogue, confirms the configured model is priced at zero, makes a
+  single real completion and asserts the provider billed it at nothing. Nothing
+  in this repository can substitute for running it once.
 - **The routing-model correction is a prior, not a measurement.** `2.3x` comes
-  from one observed pair (6,044 estimated against 13,761 counted by Groq for
-  `groq/compound`). It is a starting point that the first real 429 or completion
+  from one observed pair: 6,044 tokens estimated against 13,761 counted by the
+  provider for a routing model. It is a starting point that the first 429 or
+  completion
   moves; a different agentic model with a different internal prompt will differ,
   and until it is observed the first call for it is budgeted on that guess.
 - **Confidence measures evidence quality, not correctness.** A well-evidenced
@@ -353,8 +359,10 @@ These are real and not papered over:
   lossy `selected` fallback for the largest inputs. Streaming or a job queue
   would fix this properly and neither is built.
 - **Data still leaves the machine.** Redacted and structured, but the extracted
-  facts go to Groq. That is a property of the product category. Point
-  `GROQ_BASE_URL` at a local model if it matters.
+  facts go to OpenRouter, and from there to whichever provider serves the model.
+  That is a property of the product category, and free models in particular are
+  free because someone is getting something out of serving them — assume the
+  prompt is retained. Point `LLM_BASE_URL` at a local model if it matters.
 
 ## Testing strategy
 

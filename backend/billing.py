@@ -76,7 +76,7 @@ def free_tier_only() -> bool:
 class BillingRefused(Exception):
     """A call was stopped because it might cost money.
 
-    Carries the same `status`/`hint` shape as GroqError so the route layer can
+    Carries the same `status`/`hint` shape as LLMError so the route layer can
     surface it without a special case.
     """
 
@@ -166,8 +166,8 @@ class FreeTierGuard:
         with self._lock:
             self._verdicts = verdicts
             self._catalogue_loaded = True
-            # Not every provider publishes prices. Groq's /models lists a
-            # context window and nothing else, because on Groq "free tier" is a
+            # Not every provider publishes prices. Some /models endpoints list
+            # a context window and nothing else, because for them "free tier" is a
             # property of the account rather than of the model -- there is no
             # per-model rate to check and nothing this guard can verify.
             # Pretending to enforce there would be worse than not enforcing:
@@ -197,6 +197,20 @@ class FreeTierGuard:
     def free_models(self) -> list[str]:
         with self._lock:
             return sorted(mid for mid, (ok, _) in self._verdicts.items() if ok)
+
+    def verdict(self, model_id: str) -> tuple[bool, str]:
+        """The recorded verdict for one model, for anything that displays it.
+
+        Callers must use this rather than re-running `price_check`, because the
+        two do not agree and the disagreement is dangerous: a router in
+        `ALWAYS_PAID_MODELS` quotes zero for itself, so the price check calls it
+        free while the guard refuses it. A list that labels a model free right
+        up until the call is rejected for costing money is worse than no label.
+        """
+        with self._lock:
+            if not self._catalogue_loaded:
+                return False, "the catalogue has not been read yet"
+            return self._verdicts.get(model_id, (False, "it is not in the catalogue"))
 
     # --- the three layers --------------------------------------------------
 

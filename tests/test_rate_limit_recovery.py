@@ -18,8 +18,8 @@ import json
 import httpx
 import pytest
 
-from backend import groq_client
-from backend.groq_client import GroqError, complete
+from backend import llm_client
+from backend.llm_client import LLMError, complete
 
 RATE_LIMIT_BODY = {
     "error": {
@@ -27,8 +27,7 @@ RATE_LIMIT_BODY = {
             "Rate limit reached for model `meta-llama/llama-4-scout-17b-16e-instruct` in "
             "organization `org_01khkf68pfefpvcb9mn0fccezs` service tier `on_demand` on tokens "
             "per minute (TPM): Limit 30000, Used 18391, Requested 13761. Please try again in "
-            "4.303999999s. Need more tokens? Upgrade to Dev Tier today at "
-            "https://console.groq.com/settings/billing"
+            "4.303999999s."
         ),
         "type": "rate_limit_exceeded",
     }
@@ -36,7 +35,7 @@ RATE_LIMIT_BODY = {
 
 GOOD_BODY = {
     "choices": [{"message": {"content": '{"ok": true}'}, "finish_reason": "stop"}],
-    "model": "groq/compound",
+    "model": "openrouter/free",
     "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
 }
 
@@ -49,7 +48,7 @@ def no_real_sleep(monkeypatch):
     async def fake_sleep(seconds):
         slept.append(seconds)
 
-    monkeypatch.setattr(groq_client, "_sleep", fake_sleep)
+    monkeypatch.setattr(llm_client, "_sleep", fake_sleep)
     return slept
 
 
@@ -74,9 +73,9 @@ def scripted(monkeypatch, patch_settings):
         def client_factory():
             return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-        monkeypatch.setattr(groq_client, "_client", client_factory)
+        monkeypatch.setattr(llm_client, "_client", client_factory)
         # Settings is a frozen dataclass, so the whole object is swapped.
-        patch_settings(groq_api_key="test-key")
+        patch_settings(api_key="test-key")
         return calls
 
     return install
@@ -88,7 +87,7 @@ def test_a_rate_limit_is_waited_out_not_surfaced(scripted, no_real_sleep):
         (200, GOOD_BODY, None),
     ])
 
-    result = asyncio.run(complete("sys", "user", model="groq/compound", max_tokens=100))
+    result = asyncio.run(complete("sys", "user", model="openrouter/free", max_tokens=100))
 
     assert result["text"] == '{"ok": true}'
     assert len(calls) == 2, "the request was not retried"
@@ -102,8 +101,8 @@ def test_repeated_rate_limits_are_retried_until_the_budget_runs_out(scripted, no
     """Bounded: waiting forever is its own kind of failure."""
     scripted([(429, RATE_LIMIT_BODY, None)])
 
-    with pytest.raises(GroqError) as exc:
-        asyncio.run(complete("sys", "user", model="groq/compound", max_tokens=100, max_wait_seconds=10))
+    with pytest.raises(LLMError) as exc:
+        asyncio.run(complete("sys", "user", model="openrouter/free", max_tokens=100, max_wait_seconds=10))
 
     # 10s of budget against ~4.55s waits allows two, then gives up.
     assert len(no_real_sleep) == 2, no_real_sleep
@@ -116,18 +115,18 @@ def test_the_wait_comes_from_the_retry_after_header_when_present(scripted, no_re
         (429, RATE_LIMIT_BODY, {"retry-after": "12"}),
         (200, GOOD_BODY, None),
     ])
-    asyncio.run(complete("sys", "user", model="groq/compound", max_tokens=100))
+    asyncio.run(complete("sys", "user", model="openrouter/free", max_tokens=100))
     assert 12 <= no_real_sleep[0] <= 13
 
 
 def test_a_routing_model_reports_which_model_actually_hit_the_limit(scripted, no_real_sleep):
-    """'I chose groq/compound, why does it name llama-4-scout?' has an answer."""
+    """'I chose openrouter/free, why does it name llama-4-scout?' has an answer."""
     scripted([(429, RATE_LIMIT_BODY, None)])
 
-    with pytest.raises(GroqError) as exc:
-        asyncio.run(complete("sys", "user", model="groq/compound", max_tokens=100, max_wait_seconds=0))
+    with pytest.raises(LLMError) as exc:
+        asyncio.run(complete("sys", "user", model="openrouter/free", max_tokens=100, max_wait_seconds=0))
 
-    assert "groq/compound" in exc.value.hint
+    assert "openrouter/free" in exc.value.hint
     assert "meta-llama/llama-4-scout-17b-16e-instruct" in exc.value.hint
     assert "routed to" in exc.value.hint
 
@@ -141,11 +140,11 @@ def test_the_real_cost_is_learned_from_the_rate_limit_body(scripted, no_real_sle
     from backend.core.tokens import calibrator, estimate_messages_tokens
 
     scripted([(429, RATE_LIMIT_BODY, None)])
-    before = calibrator.for_model("groq/compound").samples
+    before = calibrator.for_model("openrouter/free").samples
 
     # A realistic prompt, so the correction is a plausible 2x rather than a
     # 100x that the outlier guard would (rightly) discard. This mirrors the
-    # real observation: a 6,044-token estimate that Groq counted as 13,761,
+    # real observation: a 6,044-token estimate the provider counted as 13,761,
     # because an agentic model prepends tool schemas we never see.
     system_prompt = "You are a careful engineering assistant. " * 700
     ours = estimate_messages_tokens(
@@ -153,13 +152,13 @@ def test_the_real_cost_is_learned_from_the_rate_limit_body(scripted, no_real_sle
     ) + 4096
     assert 4_000 < ours < 13_761, f"test prompt is not a realistic size: {ours}"
 
-    with pytest.raises(GroqError):
+    with pytest.raises(LLMError):
         asyncio.run(
-            complete(system_prompt, "analyse this", model="groq/compound",
+            complete(system_prompt, "analyse this", model="openrouter/free",
                      max_tokens=4096, max_wait_seconds=0)
         )
 
-    cal = calibrator.for_model("groq/compound")
+    cal = calibrator.for_model("openrouter/free")
     assert cal.samples > before, "nothing was learned from the provider's own arithmetic"
     assert cal.ratio > 1.0, "the estimate was under and should have been corrected upward"
     # And the correction is roughly the ratio the provider's own numbers imply.
@@ -176,12 +175,12 @@ def test_an_implausible_correction_is_discarded(scripted, no_real_sleep):
     from backend.core.tokens import calibrator
 
     scripted([(429, RATE_LIMIT_BODY, None)])
-    before = calibrator.for_model("groq/compound").samples
+    before = calibrator.for_model("openrouter/free").samples
 
-    with pytest.raises(GroqError):
-        asyncio.run(complete("s", "u", model="groq/compound", max_tokens=10, max_wait_seconds=0))
+    with pytest.raises(LLMError):
+        asyncio.run(complete("s", "u", model="openrouter/free", max_tokens=10, max_wait_seconds=0))
 
-    assert calibrator.for_model("groq/compound").samples == before
+    assert calibrator.for_model("openrouter/free").samples == before
 
 
 # --- the configured ceiling is a decision, not a suggestion ----------------
@@ -243,7 +242,7 @@ def test_the_limit_named_in_a_429_is_adopted_and_still_capped(limits):
     governance, limiter = limits(8_000)
 
     learned = governance.adopt_limit_from_rate_limit_error(
-        "groq/compound", RATE_LIMIT_BODY["error"]["message"]
+        "openrouter/free", RATE_LIMIT_BODY["error"]["message"]
     )
 
     assert learned["limit"] == 30_000
@@ -273,7 +272,7 @@ def test_a_plain_model_is_not_calibrated_from_another_model_s_limit(scripted, no
     system_prompt = "You are a careful engineering assistant. " * 700
     before = calibrator.for_model("openai/gpt-oss-120b").samples
 
-    with pytest.raises(GroqError):
+    with pytest.raises(LLMError):
         asyncio.run(
             complete(system_prompt, "analyse this", model="openai/gpt-oss-120b",
                      max_tokens=4096, max_wait_seconds=0)
@@ -289,7 +288,7 @@ def test_the_limit_itself_is_still_adopted_for_a_plain_model(scripted, no_real_s
     governance, limiter = limits(None)
     scripted([(429, RATE_LIMIT_BODY, None)])
 
-    with pytest.raises(GroqError):
+    with pytest.raises(LLMError):
         asyncio.run(complete("s", "u", model="openai/gpt-oss-120b", max_tokens=10, max_wait_seconds=0))
 
     assert limiter.per_minute == 30_000

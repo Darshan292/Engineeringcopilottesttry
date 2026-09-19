@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from backend import groq_client
+from backend import llm_client
 from backend.pipeline import base as pipeline_base
 from backend.samples import SAMPLES
 from backend.schemas import MAX_INPUT_CHARS
@@ -28,14 +28,58 @@ TOOL_INPUT = {
 def test_health_reports_model_and_key_state(client):
     body = client.get("/api/health").json()
     assert body["status"] == "ok"
-    assert body["model"]
+    assert "model" in body and "api_key_configured" in body
+
+
+def test_an_unset_model_is_reported_with_the_reason_rather_than_a_guess(client, patch_settings):
+    """Empty is a valid state here, and it has to explain itself.
+
+    No model id is compiled in, because free ids get withdrawn and a baked-in
+    default eventually becomes a 404 about a model the user never chose. The
+    cost of that decision is that a fresh install has no model, so the empty
+    value must arrive with the reason attached rather than looking like a bug.
+    """
+    patch_settings(model="")
+    body = client.get("/api/health").json()
+
+    assert body["model"] == ""
+    assert body["model_warning"]
+    assert "LLM_MODEL" in body["model_warning"]
+    assert "/api/models" in body["model_warning"]
 
 
 def test_config_never_leaks_the_api_key(client, patch_settings):
-    patch_settings(groq_api_key="gsk_super_secret")
+    """The secret value, and any field that could carry it.
+
+    A substring scan for "api_key" was the old check, and it started failing on
+    the honest `api_key_configured` boolean -- a false positive that would have
+    been "fixed" by deleting the assertion. So look for the value itself, and
+    walk the structure for a field that actually holds a key rather than one
+    that merely reports whether there is one.
+    """
+    secret = "sk-or-v1-super-secret-value"
+    patch_settings(api_key=secret)
+    body = client.get("/api/config").json()
     raw = client.get("/api/config").text
-    assert "gsk_super_secret" not in raw
-    assert "groq_api_key" not in raw
+
+    assert secret not in raw
+    assert secret[:12] not in raw, "a prefix of the key leaked, which is enough to identify it"
+
+    def walk(node, path=""):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                here = f"{path}.{key}" if path else key
+                assert key not in {"api_key", "apiKey", "key", "authorization", "token"}, (
+                    f"{here} is a field that would carry the credential itself"
+                )
+                walk(value, here)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{path}[{index}]")
+
+    walk(body)
+    # The boolean that replaced it is still there and still honest.
+    assert body["api_key_configured"] is True
 
 
 def test_config_exposes_governance_and_rate_limit_state(client):
@@ -235,12 +279,12 @@ def test_unparseable_input_for_a_tool_is_a_clear_422(client, for_tool):
 
 
 def test_missing_api_key_gives_an_actionable_503(client, patch_settings, monkeypatch):
-    patch_settings(groq_api_key="")
+    patch_settings(api_key="")
     # Unstubbed: the real client must refuse before any network call.
-    monkeypatch.setattr(pipeline_base, "complete", groq_client.complete)
+    monkeypatch.setattr(pipeline_base, "complete", llm_client.complete)
     res = client.post("/api/log-rca", json={"input": TOOL_INPUT["log-rca"]})
     assert res.status_code == 503
-    assert "GROQ_API_KEY" in res.json()["error"]
+    assert "OPENROUTER_API_KEY" in res.json()["error"]
 
 
 @pytest.mark.parametrize(
@@ -255,28 +299,58 @@ def test_http_errors_become_useful_messages(status, payload, expected_status, ne
     import httpx
 
     response = httpx.Response(status, json=payload, request=httpx.Request("POST", "https://x"))
-    err = groq_client._translate_http_error(response, "some-model")
+    err = llm_client._translate_http_error(response, "some-model")
     assert err.status == expected_status
     assert needle in err.message.lower()
 
 
-def test_retired_model_404_names_the_replacement():
-    import httpx
+def test_an_unknown_model_404_points_at_the_live_catalogue():
+    """The catalogue is the only source of truth, so the hint sends you there.
 
-    from backend.config import DEFAULT_MODEL
+    Free model ids churn: a `:free` variant that resolves today can be withdrawn
+    next week. Naming a specific replacement in the code would be a guess with a
+    shelf life, so the error names the endpoint that is always current.
+    """
+    import httpx
 
     response = httpx.Response(
         404, json={"error": {"message": "model_not_found"}}, request=httpx.Request("POST", "https://x")
     )
-    err = groq_client._translate_http_error(response, "llama-3.3-70b-versatile")
+    err = llm_client._translate_http_error(response, "some-vendor/withdrawn-model:free")
+    assert err.status == 502
+    assert "some-vendor/withdrawn-model:free" in err.message
+    assert "/api/models" in err.hint
+    assert "LLM_MODEL" in err.hint
+
+
+def test_a_known_retired_model_explains_itself_when_one_is_recorded(monkeypatch):
+    """`RETIRED_MODELS` is empty by design, so the path is tested by populating it."""
+    import httpx
+
+    from backend import config
+
+    monkeypatch.setitem(config.RETIRED_MODELS, "vendor/gone:free", "Withdrawn on 2026-09-01.")
+    response = httpx.Response(
+        404, json={"error": {"message": "model_not_found"}}, request=httpx.Request("POST", "https://x")
+    )
+    err = llm_client._translate_http_error(response, "vendor/gone:free")
     assert "retired" in err.hint
-    assert DEFAULT_MODEL in err.hint
+    assert "Withdrawn on 2026-09-01." in err.hint
 
 
-def test_default_model_is_not_one_we_know_is_dead():
-    from backend.config import DEFAULT_MODEL, RETIRED_MODELS
+def test_no_model_id_is_compiled_into_the_application():
+    """A baked-in default would rot, and rot into somebody else's confusing 404.
 
-    assert DEFAULT_MODEL not in RETIRED_MODELS
+    Free ids are withdrawn without notice. Shipping one means a user who never
+    chose it eventually gets an error about a model they have never heard of,
+    so the app declines to guess and asks them to pick from the live list.
+    """
+    from backend.config import DEFAULT_MODELS
+
+    assert set(DEFAULT_MODELS) == {"openrouter", "generic"}
+    assert all(value == "" for value in DEFAULT_MODELS.values()), (
+        f"a model id was compiled in: {DEFAULT_MODELS}"
+    )
 
 
 # --- repair loop ----------------------------------------------------------

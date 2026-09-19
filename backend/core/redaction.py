@@ -75,7 +75,7 @@ RULES: tuple[Rule, ...] = (
     Rule("STRIPE_KEY", Sensitivity.CREDENTIAL, _c(r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}\b")),
     Rule("GOOGLE_API_KEY", Sensitivity.CREDENTIAL, _c(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
     Rule("OPENAI_KEY", Sensitivity.CREDENTIAL, _c(r"\bsk-[A-Za-z0-9]{20,}\b")),
-    Rule("GROQ_KEY", Sensitivity.CREDENTIAL, _c(r"\bgsk_[A-Za-z0-9]{20,}\b")),
+    Rule("OPENROUTER_KEY", Sensitivity.CREDENTIAL, _c(r"\bgsk_[A-Za-z0-9]{20,}\b")),
     Rule("SENDGRID_KEY", Sensitivity.CREDENTIAL, _c(r"\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\b")),
     Rule("NPM_TOKEN", Sensitivity.CREDENTIAL, _c(r"\bnpm_[A-Za-z0-9]{36}\b")),
     # --- structured credentials ---

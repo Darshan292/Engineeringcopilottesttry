@@ -4,7 +4,7 @@ Every other test stubs `pipeline.base.complete`, which leaves the actual
 network path untested: auth header, request body shape, `response_format`,
 response parsing, and error translation against real `httpx.Response` objects.
 
-This stands up an ASGI server that speaks Groq's wire protocol and drives the
+This stands up an ASGI server that speaks the OpenAI-compatible wire protocol and drives the
 whole stack through it. No network, no API key, no cost.
 """
 
@@ -22,17 +22,17 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-from backend import groq_client
+from backend import llm_client
 from backend.main import app as copilot_app
 from backend.routes import tools as tools_route
 from backend.samples import LOG_RCA_SAMPLE
 from conftest import VALID_RESPONSES
 
-mock_groq = FastAPI()
+mock_upstream = FastAPI()
 mock_state: dict = {"mode": "ok", "last_request": None, "last_auth": None}
 
 
-@mock_groq.post("/openai/v1/chat/completions")
+@mock_upstream.post("/openai/v1/chat/completions")
 async def chat_completions(request: Request):
     mock_state["last_request"] = await request.json()
     mock_state["last_auth"] = request.headers.get("authorization")
@@ -72,7 +72,7 @@ async def chat_completions(request: Request):
     }
 
 
-@mock_groq.get("/openai/v1/models")
+@mock_upstream.get("/openai/v1/models")
 async def models():
     return {
         "data": [
@@ -91,7 +91,7 @@ def _free_port() -> int:
 @pytest.fixture(scope="module")
 def mock_base_url():
     port = _free_port()
-    config = uvicorn.Config(mock_groq, host="127.0.0.1", port=port, log_level="error")
+    config = uvicorn.Config(mock_upstream, host="127.0.0.1", port=port, log_level="error")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -100,7 +100,7 @@ def mock_base_url():
     while not server.started and time.time() < deadline:
         time.sleep(0.05)
     if not server.started:
-        pytest.fail("mock Groq server did not start")
+        pytest.fail("mock upstream server did not start")
 
     yield f"http://127.0.0.1:{port}/openai/v1"
 
@@ -111,13 +111,13 @@ def mock_base_url():
 @pytest.fixture
 def http_client(mock_base_url, monkeypatch):
     replaced = dataclasses.replace(
-        groq_client.settings,
-        groq_base_url=mock_base_url,
-        groq_api_key="gsk_test_key",
-        groq_model="qwen/qwen3.8-27b",
+        llm_client.settings,
+        base_url=mock_base_url,
+        api_key="gsk_test_key",
+        model="qwen/qwen3.8-27b",
         timeout_seconds=15.0,
     )
-    monkeypatch.setattr(groq_client, "settings", replaced)
+    monkeypatch.setattr(llm_client, "settings", replaced)
     monkeypatch.setattr(tools_route, "settings", replaced)
     mock_state["mode"] = "ok"
     return TestClient(copilot_app)
@@ -137,7 +137,7 @@ def test_full_round_trip_over_real_http(http_client):
     assert body["diagnostics"]["grounding"]["citations_valid"] > 0
 
 
-def test_request_body_matches_the_groq_wire_format(http_client):
+def test_request_body_matches_the_openai_wire_format(http_client):
     http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     sent = mock_state["last_request"]
 
@@ -205,7 +205,7 @@ def test_a_transient_429_is_waited_out_and_the_request_still_succeeds(http_clien
         slept.append(seconds)
         mock_state["mode"] = "ok"  # the window has rolled
 
-    monkeypatch.setattr(groq_client, "_sleep", fake_sleep)
+    monkeypatch.setattr(llm_client, "_sleep", fake_sleep)
     mock_state["mode"] = "rate_limited"
 
     res = http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
@@ -221,7 +221,7 @@ def test_a_persistent_429_is_retried_and_then_reported_honestly(http_client, mon
     async def fake_sleep(seconds):
         slept.append(seconds)
 
-    monkeypatch.setattr(groq_client, "_sleep", fake_sleep)
+    monkeypatch.setattr(llm_client, "_sleep", fake_sleep)
     mock_state["mode"] = "rate_limited"
 
     res = http_client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
@@ -242,14 +242,14 @@ def test_empty_completion_is_an_error_not_a_blank_page(http_client):
 
 def test_unreachable_endpoint_gives_a_network_error(monkeypatch):
     replaced = dataclasses.replace(
-        groq_client.settings,
-        groq_base_url=f"http://127.0.0.1:{_free_port()}/openai/v1",
-        groq_api_key="gsk_test_key",
+        llm_client.settings,
+        base_url=f"http://127.0.0.1:{_free_port()}/openai/v1",
+        api_key="gsk_test_key",
         timeout_seconds=3.0,
     )
-    monkeypatch.setattr(groq_client, "settings", replaced)
+    monkeypatch.setattr(llm_client, "settings", replaced)
     monkeypatch.setattr(tools_route, "settings", replaced)
 
     res = TestClient(copilot_app).post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
     assert res.status_code == 502
-    assert "could not reach groq" in res.json()["error"].lower()
+    assert "could not reach" in res.json()["error"].lower()

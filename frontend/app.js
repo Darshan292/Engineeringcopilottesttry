@@ -119,11 +119,11 @@ async function loadConfig() {
       // The key's name and where to get it both depend on the provider, so
       // both come from the backend rather than being written in here.
       const provider = cfg.provider || {};
-      const keyName = provider.provider === "openrouter" ? "OPENROUTER_API_KEY" : "GROQ_API_KEY";
+      const keyName = provider.provider === "openrouter" ? "OPENROUTER_API_KEY" : "OPENROUTER_API_KEY";
       const keysUrl =
         provider.provider === "openrouter"
           ? "https://openrouter.ai/settings/keys"
-          : "https://console.groq.com/keys";
+          : "https://openrouter.ai/settings/keys";
       els.statusDot.className = "dot dot-bad";
       showBanner(
         `No ${escapeHtml(keyName)} set.`,
@@ -152,7 +152,7 @@ async function loadConfig() {
 /**
  * Show whichever allowance the provider actually rations.
  *
- * Groq rations tokens per minute; OpenRouter's free tier rations requests, and
+ * Some providers ration tokens per minute; OpenRouter's free tier rations requests, and
  * reports no token ceiling at all. Hiding the chip when there is no token limit
  * left the one number that matters on that provider -- how many of today's 50
  * requests are left -- visible nowhere.

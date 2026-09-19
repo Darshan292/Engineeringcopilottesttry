@@ -32,7 +32,7 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 app = FastAPI(
     title="Engineering Copilot",
     description=(
-        "Four local engineering tools backed by the Groq free tier: unit test "
+        "Four local engineering tools backed by OpenRouter's free tier: unit test "
         "generation, API docs, log/RCA summaries, and blameless postmortems. "
         "Stateless -- nothing is persisted between requests."
     ),
@@ -71,7 +71,7 @@ async def health():
     return {
         "status": "ok",
         "api_key_configured": settings.has_api_key,
-        "model": settings.groq_model,
+        "model": settings.model,
         "model_warning": settings.model_warning,
     }
 
@@ -79,7 +79,7 @@ async def health():
 async def _announce_billing_posture(provider) -> None:
     """Load the provider's price list and say plainly what may be spent."""
     from .billing import free_tier_only, guard
-    from .groq_client import list_models
+    from .llm_client import list_models
 
     if not free_tier_only():
         log.warning(
@@ -105,7 +105,7 @@ async def _announce_billing_posture(provider) -> None:
     free = guard.free_models()
     log.info("  billing: %d free model(s) available to this key", len(free))
 
-    configured = (settings.groq_model or "").strip()
+    configured = (settings.model or "").strip()
     if not configured:
         return
     try:
@@ -122,10 +122,10 @@ async def _announce_billing_posture(provider) -> None:
 async def announce() -> None:
     from .providers import api_key_env_name, detect_provider
 
-    provider = detect_provider(settings.groq_base_url)
+    provider = detect_provider(settings.base_url)
     log.info("Engineering Copilot starting")
-    log.info("  provider: %s (%s)", provider.label, settings.groq_base_url)
-    log.info("  model: %s", settings.groq_model or "(not set)")
+    log.info("  provider: %s (%s)", provider.label, settings.base_url)
+    log.info("  model: %s", settings.model or "(not set)")
     if not settings.has_api_key:
         key_name = api_key_env_name(provider)
         log.warning("  %s is NOT set -- every tool call will fail with 503.", key_name)

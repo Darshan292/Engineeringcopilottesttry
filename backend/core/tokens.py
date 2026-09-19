@@ -144,8 +144,8 @@ class ModelCalibration:
 # A routing or agentic model does not send what we composed. The provider
 # prepends its own instructions and the tool schemas the agent may call, none of
 # which appear in the text this application built, so an estimate measured from
-# our own messages is systematically low -- observed at roughly 2.3x on Groq's
-# compound models (6,044 estimated against 13,761 counted).
+# our own messages is systematically low -- observed at roughly 2.3x on one
+# agentic router (6,044 estimated against 13,761 counted).
 #
 # Starting such a model at 1.0 means the first request is budgeted at under half
 # its real cost, is accepted by the local limiter, and is then refused by the
@@ -189,17 +189,18 @@ calibrator = Calibrator()
 
 # --- context windows ------------------------------------------------------
 
-# Known context windows. Unknown models fall back to the conservative default
-# rather than assuming a large window and failing at request time.
-CONTEXT_WINDOWS: dict[str, int] = {
-    "qwen/qwen3.8-27b": 131_042,
-    "groq/compound": 131_072,
-    "groq/compound-mini": 131_072,
-    "openai/gpt-oss-120b": 131_072,
-    "openai/gpt-oss-20b": 131_072,
-    "llama-3.3-70b-versatile": 131_072,
-    "llama-3.1-8b-instant": 131_072,
-}
+# Known context windows, as a last resort only.
+#
+# Deliberately empty. OpenRouter publishes `context_length` for every model on
+# `/api/v1/models`, which this app already fetches for the billing guard, so the
+# real figure is always available and a compiled-in table could only be a
+# staler, more confidently wrong copy of it. Entries here would also go out of
+# date exactly as the model ids did.
+#
+# Tests and self-hosted endpoints that publish nothing can still populate this
+# at runtime; unknown models fall back to the conservative default below rather
+# than assuming a large window and failing at request time.
+CONTEXT_WINDOWS: dict[str, int] = {}
 
 DEFAULT_CONTEXT_WINDOW = 8_192
 
@@ -242,20 +243,27 @@ def suggested_models() -> list[str]:
     """Chat models known to work, preferring what the provider confirmed.
 
     The registry fills from the live `/api/models` call, so after one request
-    these are real ids for whichever provider is configured. The hardcoded
-    fallback is Groq's, and is only offered when the provider is Groq -- naming
-    `openai/gpt-oss-120b` to someone on OpenRouter is advice that does not work.
+    these are real ids for the configured provider. There is no compiled-in
+    fallback: naming a model that this key cannot call, or that no longer
+    exists, is worse than admitting we do not know yet and pointing at the live
+    list. On OpenRouter the free catalogue changes week to week, so a suggestion
+    that is not drawn from it would be a guess presented as advice.
+
+    Free models are preferred, because a suggestion the caller cannot act on
+    without being billed is not a suggestion this application should make.
     """
-    known = [m for m in registry._windows if non_chat_reason(m) is None and registry._windows[m] >= MIN_USABLE_CONTEXT]
-    if known:
-        # Largest window first: more headroom means fewer compressions.
-        return sorted(known, key=lambda m: -registry._windows[m])[:4]
+    usable = [
+        m for m, window in registry._windows.items()
+        if non_chat_reason(m) is None and window >= MIN_USABLE_CONTEXT
+    ]
+    if not usable:
+        return []
 
-    from ..config import settings
+    from ..billing import guard
 
-    if settings.provider == "groq":
-        return ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
-    return []
+    free = set(guard.free_models())
+    # Free first, then widest window: more headroom means fewer compressions.
+    return sorted(usable, key=lambda m: (m not in free, -registry._windows[m]))[:4]
 
 
 def model_suggestion() -> str:
@@ -294,7 +302,7 @@ class ModelRegistry:
         """Record that a refresh was tried, successful or not.
 
         Without this, an endpoint that does not serve /models -- a local
-        llama.cpp build, a proxy, anything non-Groq -- means every single
+        llama.cpp build, a proxy, an unfamiliar gateway -- means every single
         request pays a failing round trip forever, because the cache never
         fills and therefore never stops looking stale.
         """
@@ -360,7 +368,7 @@ def context_window_for(model: str) -> tuple[int, str]:
         return CONTEXT_WINDOWS[model], "static-table"
 
     # Match on the bare name when the operator uses a provider prefix we do
-    # not have listed, e.g. "groq/qwen/qwen3.6-27b".
+    # not have listed, e.g. a "vendor/" prefix on an already-qualified id.
     tail = model.rsplit("/", 1)[-1]
     for known, window in CONTEXT_WINDOWS.items():
         if known.rsplit("/", 1)[-1] == tail:

@@ -18,7 +18,7 @@ import json
 import httpx
 import pytest
 
-from backend import billing, groq_client
+from backend import billing, llm_client
 from backend.billing import BillingRefused, FreeTierGuard, price_check
 
 FREE = {"prompt": "0", "completion": "0", "request": "0", "image": "0"}
@@ -38,7 +38,7 @@ def loaded_guard(monkeypatch):
     fresh = FreeTierGuard()
     fresh.load_catalogue(CATALOGUE)
     monkeypatch.setattr(billing, "guard", fresh)
-    monkeypatch.setattr(groq_client, "guard", fresh)
+    monkeypatch.setattr(llm_client, "guard", fresh)
     monkeypatch.delenv("FREE_TIER_ONLY", raising=False)
     return fresh
 
@@ -172,17 +172,17 @@ def never_called(monkeypatch, patch_settings):
         })
 
     monkeypatch.setattr(
-        groq_client, "_client",
+        llm_client, "_client",
         lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
-    patch_settings(groq_api_key="test-key")
+    patch_settings(api_key="test-key")
     return reached
 
 
 def test_a_paid_model_never_reaches_the_network(loaded_guard, never_called):
     with pytest.raises(BillingRefused):
         asyncio.run(
-            groq_client.complete("sys", "user", model="anthropic/claude-sonnet-4", max_tokens=10)
+            llm_client.complete("sys", "user", model="anthropic/claude-sonnet-4", max_tokens=10)
         )
     assert never_called == [], "a paid model was actually sent to the provider"
 
@@ -199,13 +199,13 @@ def test_a_free_model_does_reach_the_network_and_carries_the_ceiling(loaded_guar
         })
 
     monkeypatch.setattr(
-        groq_client, "_client",
+        llm_client, "_client",
         lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
-    patch_settings(groq_api_key="test-key", groq_base_url="https://openrouter.ai/api/v1")
+    patch_settings(api_key="test-key", base_url="https://openrouter.ai/api/v1")
 
     result = asyncio.run(
-        groq_client.complete("sys", "user", model="deepseek/deepseek-chat:free", max_tokens=10)
+        llm_client.complete("sys", "user", model="deepseek/deepseek-chat:free", max_tokens=10)
     )
 
     assert result["text"] == '{"ok": true}'
@@ -284,3 +284,44 @@ def test_the_request_limiter_charges_every_upstream_call(client, for_tool):
     assert after - before == stub.call_count, (
         f"{stub.call_count} upstream call(s) were made but {after - before} recorded"
     )
+
+
+def test_the_model_list_never_labels_a_blocked_router_as_free():
+    """The label and the enforcement must be the same verdict.
+
+    `openrouter/auto` quotes zero for itself and then dispatches across the
+    whole catalogue, paid models included. The price check therefore calls it
+    free while the guard refuses it, so a listing built from `price_check`
+    advertised it as free right up until the call was rejected for costing
+    money. The listing reads the guard's recorded verdict instead.
+    """
+    from backend.billing import ALWAYS_PAID_MODELS, FreeTierGuard, price_check
+
+    router = next(iter(ALWAYS_PAID_MODELS))
+    catalogue = [
+        {"id": router, "pricing": {"prompt": "0", "completion": "0"}},
+        {"id": "vendor/genuine:free", "pricing": {"prompt": "0", "completion": "0"}},
+    ]
+
+    guard = FreeTierGuard()
+    guard.load_catalogue(catalogue)
+
+    # The trap: judged on price alone, the router looks free.
+    assert price_check(catalogue[0])[0] is True
+
+    # The guard does not agree, and the verdict accessor reports the guard.
+    free, why_not = guard.verdict(router)
+    assert free is False
+    assert "router" in why_not
+    assert guard.verdict("vendor/genuine:free")[0] is True
+    assert router not in guard.free_models()
+
+
+def test_a_verdict_is_never_optimistic_before_the_catalogue_is_read():
+    """Unknown means refused, including for anything that displays it."""
+    from backend.billing import FreeTierGuard
+
+    guard = FreeTierGuard()
+    free, why_not = guard.verdict("anything/at-all:free")
+    assert free is False
+    assert "not been read" in why_not

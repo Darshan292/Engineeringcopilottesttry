@@ -6,7 +6,7 @@ off or permissive by default so local use is unchanged, and each turns on with
 one environment variable.
 
 The rate limiter is deliberately the service's own, not a reliance on the
-upstream provider's. Leaning on Groq's 429 means every over-limit request pays
+upstream provider's. Leaning on the provider's 429 means every over-limit request pays
 a network round trip, consumes daily quota, and returns an error that mentions
 a vendor the caller has no relationship with. Shedding locally is faster,
 cheaper and gives a better error.
@@ -253,7 +253,7 @@ class SlidingWindowLimiter:
 
 # Defaults sit just under the active provider's free tier so the local limiter,
 # not the upstream 429, is what a caller hits first. They differ sharply:
-# Groq rations tokens and is relaxed about request count, while OpenRouter's
+# Some providers ration tokens and are relaxed about request count, while OpenRouter's
 # free tier rations requests -- 20 a minute and as few as 50 a day -- and states
 # no token ceiling at all. Compiling either one's numbers in as "the" defaults
 # means the wrong limiter binds and the useful one never fires.
@@ -269,7 +269,7 @@ class TokenBudgetLimiter:
     """Sliding-window limiter over TOKENS, not requests.
 
     Requests per minute is the limit that is easy to model and the wrong one to
-    model. On Groq's free tier a chat model allows 30 requests/minute but only
+    model. On a token-rationed tier a chat model may allow 30 requests/minute but only
     8,000 tokens/minute, and this application's requests are large: a system
     prompt plus extracted facts plus a structured response is several thousand
     tokens, so the token ceiling binds long before the request ceiling does.
@@ -416,7 +416,7 @@ class TokenBudgetLimiter:
         }
 
 
-# Matched to the Groq free tier's chat-model ceiling (8,000 TPM / 200,000 TPD
+# A token ceiling applies only where the provider rations tokens (OpenRouter's
 # for gpt-oss-120b). Raise these if your account has a higher allowance --
 # they exist to fail fast locally, not to be conservative for its own sake.
 # What the operator explicitly asked for, or None when they left it to us.
@@ -485,7 +485,7 @@ async def await_token_budget(
             hint=(
                 f"{configured}. Raise it to at least {int(estimated_tokens * 1.2):,} if your "
                 f"account allows, paste a smaller excerpt, or switch to a model whose per-call "
-                f"cost is lower. Note that a routing model such as groq/compound sends tool "
+                f"cost is lower. Note that a routing model sends routing instructions alongside "
                 f"schemas and internal instructions alongside your text, so one call costs "
                 f"roughly twice what the visible input suggests; a plain chat model like "
                 f"openai/gpt-oss-120b does not."
@@ -528,7 +528,7 @@ def _parse_limit_header(value: str | None) -> int | None:
 def adopt_provider_limits(headers) -> dict | None:
     """Tune the local token budget from the provider's own rate-limit headers.
 
-    Limits differ per model -- on Groq's free tier one chat model allows 8,000
+    Limits differ per model -- on one free tier a chat model may allow 8,000
     tokens/minute and another 30,000, and a day's allowance differs too. Any
     number compiled into this application is a guess about someone else's
     account, so the provider's own headers are the better source.
@@ -538,7 +538,7 @@ def adopt_provider_limits(headers) -> dict | None:
     TOKEN_LIMIT_PER_MINUTE=8000 watched the UI report 70,000 after the first
     response and had no way to hold the budget down. Worse, the number the
     provider advertises is not always the one that binds -- a routing model like
-    `groq/compound` reports its own generous allowance and then dispatches to an
+    a router reports its own generous allowance and then dispatches to an
     underlying model with a much smaller one, and the 429 names a model the
     caller never chose.
 
@@ -571,7 +571,7 @@ def adopt_provider_limits(headers) -> dict | None:
 def adopt_limit_from_rate_limit_error(model: str, detail: str) -> dict | None:
     """Learn the real ceiling from a 429's own words.
 
-    Groq states the arithmetic in the error body:
+    A provider may state the arithmetic in the error body:
 
         Rate limit reached for model `meta-llama/llama-4-scout-17b-16e-instruct`
         ... on tokens per minute (TPM): Limit 30000, Used 18391, Requested 13761
@@ -632,7 +632,7 @@ def enforce_token_budget(client: str, estimated_tokens: int, *, stage: str = "th
         )
 
 # Bounds how many upstream calls are in flight at once. Without it, twenty
-# concurrent browser tabs become twenty simultaneous Groq calls and a 429.
+# concurrent browser tabs become twenty simultaneous upstream calls and a 429.
 _MAX_CONCURRENCY = _env_int("MAX_CONCURRENT_REQUESTS", 4)
 _semaphore: asyncio.Semaphore | None = None
 

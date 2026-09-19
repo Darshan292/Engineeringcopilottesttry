@@ -1,9 +1,13 @@
-"""Thin async client for Groq's OpenAI-compatible chat completions endpoint.
+"""Thin async client for an OpenAI-compatible chat completions endpoint.
 
-Raw HTTP via httpx rather than the `groq` SDK: one fewer dependency, and the
-wire format is stable and OpenAI-compatible, so this keeps working across SDK
-churn. The value this module adds over a bare POST is error translation --
-turning Groq's HTTP failures into messages that tell you what to actually do.
+Raw HTTP via httpx rather than a vendor SDK: one fewer dependency, and the wire
+format is stable and OpenAI-compatible, so this keeps working across SDK churn.
+The value this module adds over a bare POST is threefold -- translating HTTP
+failures into messages that say what to fix, waiting out a rate limit instead of
+surfacing it, and refusing to send anything the billing guard has not cleared as
+free.
+
+What differs between endpoints lives in `providers.py`, not here.
 """
 
 from __future__ import annotations
@@ -16,11 +20,11 @@ from typing import Any
 
 import httpx
 
-from .config import DEFAULT_MODEL, RETIRED_MODELS, settings
+from .config import RETIRED_MODELS, settings
 from .billing import guard, price_check
 from .providers import api_key_env_name, detect_provider, seconds_until_reset
 
-log = logging.getLogger("copilot.groq")
+log = logging.getLogger("copilot.llm")
 
 # A 429 is the provider telling us when to come back, not that the work cannot
 # be done. Waiting it out is the whole difference between "this application
@@ -43,8 +47,8 @@ async def _sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
-class GroqError(Exception):
-    """A Groq call failed in a way the user needs to read.
+class LLMError(Exception):
+    """An upstream call failed in a way the user needs to read.
 
     `status` is the HTTP status we should surface to the browser; `hint` is the
     actionable remediation line shown under the error in the UI.
@@ -73,17 +77,17 @@ def _client() -> httpx.AsyncClient:
     would send the request to the proxy, which refuses to tunnel to localhost,
     and the app fails with a confusing 403 for a server running on the same
     machine. `trust_env=False` bypasses proxy resolution for that case only;
-    real Groq traffic still honours the environment's proxy settings.
+    remote traffic still honours the environment's proxy settings.
     """
     return httpx.AsyncClient(
         timeout=settings.timeout_seconds,
-        trust_env=not _is_loopback(settings.groq_base_url),
+        trust_env=not _is_loopback(settings.base_url),
     )
 
 
 def _auth_headers() -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {settings.groq_api_key}",
+        "Authorization": f"Bearer {settings.api_key}",
         "Content-Type": "application/json",
         # Whatever this provider wants alongside the key. OpenRouter uses
         # HTTP-Referer and X-Title for attribution; others ignore them.
@@ -97,7 +101,7 @@ def _provider():
     Resolved per call rather than captured at import, so a test or a reload that
     repoints the endpoint is picked up instead of silently using the old rules.
     """
-    return detect_provider(settings.groq_base_url)
+    return detect_provider(settings.base_url)
 
 
 def _require_key() -> None:
@@ -109,7 +113,7 @@ def _require_key() -> None:
             if provider.console_keys_url
             else ""
         )
-        raise GroqError(
+        raise LLMError(
             f"{key_name} is not set, so there is nothing to authenticate with.",
             status=503,
             hint=(
@@ -120,7 +124,7 @@ def _require_key() -> None:
 
 
 def _extract_api_error(response: httpx.Response) -> str:
-    """Pull Groq's own error string out of the body, falling back to raw text."""
+    """Pull the provider's own error string out of the body, else raw text."""
     try:
         payload = response.json()
     except ValueError:
@@ -133,22 +137,26 @@ def _extract_api_error(response: httpx.Response) -> str:
     return str(payload)[:500]
 
 
-def _translate_http_error(response: httpx.Response, model: str) -> GroqError:
-    """Map a Groq HTTP failure onto a message that says what to fix."""
+def _translate_http_error(response: httpx.Response, model: str) -> LLMError:
+    """Map an HTTP failure onto a message that says what to fix."""
     detail = _extract_api_error(response)
     code = response.status_code
 
     if code in (401, 403):
-        return GroqError(
-            f"Groq rejected the API key ({code}): {detail}",
+        return LLMError(
+            f"{_provider().label} rejected the API key ({code}): {detail}",
             status=502,
-            hint="Check GROQ_API_KEY in .env. Regenerate it at https://console.groq.com/keys if unsure.",
+            hint=(
+                f"Check {api_key_env_name(_provider())} in .env. "
+                f"Regenerate it at {_provider().console_keys_url} if unsure."
+            ),
         )
 
     if code == 404 or "model_not_found" in detail or "does not exist" in detail.lower():
         retired = RETIRED_MODELS.get(model)
         hint = (
-            f"'{model}' is retired: {retired} Set LLM_MODEL={DEFAULT_MODEL} in .env and restart."
+            f"'{model}' is retired: {retired} Pick another from GET /api/models "
+            f"and set LLM_MODEL in .env."
             if retired
             else (
                 f"{_provider().label} does not serve '{model}' on this account. "
@@ -156,7 +164,7 @@ def _translate_http_error(response: httpx.Response, model: str) -> GroqError:
                 f"then set LLM_MODEL in .env. {_provider().model_hint}"
             )
         )
-        return GroqError(f"Model '{model}' is unavailable: {detail}", status=502, hint=hint)
+        return LLMError(f"Model '{model}' is unavailable: {detail}", status=502, hint=hint)
 
     if code == 429:
         # Only reached once the retries below are exhausted, so the advice is
@@ -168,8 +176,8 @@ def _translate_http_error(response: httpx.Response, model: str) -> GroqError:
             if routed and routed != model
             else ""
         )
-        return GroqError(
-            f"Groq rate limit hit and did not clear after waiting: {detail}",
+        return LLMError(
+            f"{_provider().label} rate limit hit and did not clear after waiting: {detail}",
             status=429,
             hint=(
                 f"This request waited for the allowance to roll and the limit was still "
@@ -180,20 +188,20 @@ def _translate_http_error(response: httpx.Response, model: str) -> GroqError:
         )
 
     if code == 413 or "too large" in detail.lower() or "context" in detail.lower():
-        return GroqError(
+        return LLMError(
             f"Input too large for the model's context window: {detail}",
             status=413,
-            hint="Paste a smaller excerpt, or lower GROQ_MAX_TOKENS to leave more room for input.",
+            hint="Paste a smaller excerpt, or lower LLM_MAX_TOKENS to leave more room for input.",
         )
 
     if code >= 500:
-        return GroqError(
-            f"Groq returned a server error ({code}): {detail}",
+        return LLMError(
+            f"{_provider().label} returned a server error ({code}): {detail}",
             status=502,
             hint="This is upstream, not your config. Retry in a few seconds.",
         )
 
-    return GroqError(f"Groq request failed ({code}): {detail}", status=502)
+    return LLMError(f"{_provider().label} request failed ({code}): {detail}", status=502)
 
 
 
@@ -267,7 +275,7 @@ def _retry_delay(response: httpx.Response, detail: str, attempt: int) -> float:
     written to fix -- on a different provider.
 
     The reset header is parsed through the provider profile because its units
-    are not agreed: Groq states a duration, OpenRouter an absolute Unix
+    are not agreed: some state a duration, OpenRouter an absolute Unix
     millisecond timestamp. `seconds_until_reset` also sanity-checks the
     magnitude, so mislabelling one as the other cannot produce an absurd sleep.
     """
@@ -318,10 +326,10 @@ async def complete(
     """
     _require_key()
 
-    chosen_model = (model or settings.groq_model).strip()
+    chosen_model = (model or settings.model).strip()
     if not chosen_model:
         provider = _provider()
-        raise GroqError(
+        raise LLMError(
             f"No model is configured, so there is nothing to send the request to.",
             status=503,
             hint=(
@@ -359,19 +367,19 @@ async def complete(
         try:
             async with _client() as client:
                 return await client.post(
-                    f"{settings.groq_base_url}/chat/completions",
+                    f"{settings.base_url}/chat/completions",
                     headers=_auth_headers(),
                     json=body,
                 )
         except httpx.TimeoutException as exc:
-            raise GroqError(
-                f"Groq did not respond within {settings.timeout_seconds:.0f}s.",
+            raise LLMError(
+                f"{_provider().label} did not respond within {settings.timeout_seconds:.0f}s.",
                 status=504,
-                hint="Try a shorter input, or raise GROQ_TIMEOUT_SECONDS in .env.",
+                hint="Try a shorter input, or raise LLM_TIMEOUT_SECONDS in .env.",
             ) from exc
         except httpx.HTTPError as exc:
-            raise GroqError(
-                f"Could not reach Groq: {exc}",
+            raise LLMError(
+                f"Could not reach {_provider().label}: {exc}",
                 status=502,
                 hint="Check your network connection and that LLM_BASE_URL is correct.",
             ) from exc
@@ -439,19 +447,19 @@ async def complete(
         choice = payload["choices"][0]
         text = choice["message"]["content"] or ""
     except (ValueError, KeyError, IndexError) as exc:
-        raise GroqError(
-            f"Groq returned a response this app could not parse: {exc}",
+        raise LLMError(
+            f"{_provider().label} returned a response this app could not parse: {exc}",
             status=502,
             hint="This usually means the endpoint is not OpenAI-compatible. Check LLM_BASE_URL.",
         ) from exc
 
     if not text.strip():
-        raise GroqError(
-            "Groq returned an empty completion.",
+        raise LLMError(
+            f"{_provider().label} returned an empty completion.",
             status=502,
             hint=(
                 "Often means max_tokens was consumed by reasoning, or the input was "
-                "filtered. Try a smaller input or raise GROQ_MAX_TOKENS."
+                "filtered. Try a smaller input or raise LLM_MAX_TOKENS."
             ),
         )
 
@@ -503,7 +511,7 @@ async def complete(
 def _context_length_of(model: dict) -> int | None:
     """The model's context window, under whichever name this provider uses.
 
-    Groq says `context_window`, OpenRouter says `context_length` and also
+    Some say `context_window`, OpenRouter says `context_length` and also
     repeats it under `top_provider`. Accepting all of them costs three lines and
     removes a whole class of "why does every model show an unknown window".
     """
@@ -525,7 +533,7 @@ def _vendor_of(model_id: str) -> str | None:
 
 
 async def list_models() -> list[dict[str, Any]]:
-    """Ask Groq what this key can actually call, right now.
+    """Ask the provider what this key can actually call, right now.
 
     Model IDs churn -- this is the only trustworthy source, so the UI reads it
     rather than trusting any list baked into the code.
@@ -534,18 +542,18 @@ async def list_models() -> list[dict[str, Any]]:
     try:
         async with _client() as client:
             response = await client.get(
-                f"{settings.groq_base_url}/models", headers=_auth_headers()
+                f"{settings.base_url}/models", headers=_auth_headers()
             )
     except httpx.HTTPError as exc:
-        raise GroqError(f"Could not reach {_provider().label}: {exc}", status=502) from exc
+        raise LLMError(f"Could not reach {_provider().label}: {exc}", status=502) from exc
 
     if response.status_code >= 400:
-        raise _translate_http_error(response, settings.groq_model)
+        raise _translate_http_error(response, settings.model)
 
     try:
         data = response.json().get("data", [])
     except ValueError as exc:
-        raise GroqError(f"{_provider().label}'s model list was not valid JSON.", status=502) from exc
+        raise LLMError(f"{_provider().label}'s model list was not valid JSON.", status=502) from exc
 
     from .core.tokens import MIN_USABLE_CONTEXT, non_chat_reason
 
@@ -577,7 +585,13 @@ async def list_models() -> list[dict[str, Any]]:
                 # disagree with what the app will actually allow is worse than
                 # no label: it tells you a model is free right up until the
                 # call is refused for costing money.
-                "free": price_check(m)[0],
+                #
+                # This said exactly that and then called `price_check` anyway,
+                # which is not the same function: it reads the price list and
+                # knows nothing about routers that quote zero for themselves
+                # while dispatching to paid models. `openrouter/auto` was
+                # listed as free and refused when called.
+                "free": guard.verdict(str(model_id))[0],
                 # The provider lists every model the key can call, including
                 # classifiers and speech models. Selecting one of those fails
                 # deep in the pipeline, so mark them here where they are listed.

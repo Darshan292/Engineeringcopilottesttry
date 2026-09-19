@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import pytest
 
+from tests.conftest import TEST_MODEL, TEST_MODEL_WINDOW
+
 from backend.core.chunking import plan_context
 from backend.core.detect import detect_input_kind, detect_language, mismatch_warning
 from backend.core.injection import neutralize, scan
@@ -33,7 +35,7 @@ from backend.samples import SAMPLES
 
 SECRETS = [
     ("AWS_ACCESS_KEY", "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE"),
-    ("GROQ_KEY", "GROQ_API_KEY=gsk_abcdefghijklmnopqrstuvwxyz012345"),
+    ("OPENROUTER_KEY", "OPENROUTER_API_KEY=gsk_abcdefghijklmnopqrstuvwxyz012345"),
     ("GITHUB_TOKEN", "token ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
     ("JWT", "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
     ("STRIPE_KEY", "sk_live_abcdefghijklmnop1234"),
@@ -79,7 +81,7 @@ def test_public_ips_are_redacted_only_when_policy_says_so():
 @pytest.mark.parametrize(
     "text",
     [
-        'api_key = os.environ["GROQ_API_KEY"]',
+        'api_key = os.environ["OPENROUTER_API_KEY"]',
         "password: changeme",
         "token: ${VAULT_TOKEN}",
         "secret = process.env.SECRET",
@@ -102,7 +104,7 @@ def test_credentials_cannot_be_disabled_by_policy():
 
 
 def test_redaction_report_never_serializes_the_value():
-    report = redact("GROQ_API_KEY=gsk_abcdefghijklmnopqrstuvwxyz012345", POLICY_STRICT)
+    report = redact("OPENROUTER_API_KEY=gsk_abcdefghijklmnopqrstuvwxyz012345", POLICY_STRICT)
     assert "gsk_" not in str(report.public())
 
 
@@ -131,11 +133,8 @@ def test_estimator_never_returns_zero_for_content():
 
 
 def test_unknown_models_fall_back_to_a_small_window():
-    # 131,042 rather than a round 131,072: that is the figure Groq's own
-    # /models reports for this one, and the table records what the provider
-    # says rather than what looks tidy.
-    window, source = context_window_for("qwen/qwen3.8-27b")
-    assert window == 131_042 and source == "static-table"
+    window, source = context_window_for(TEST_MODEL)
+    assert window == TEST_MODEL_WINDOW and source == "static-table"
 
     window, source = context_window_for("something-nobody-has-heard-of")
     assert window == 8_192
@@ -143,8 +142,8 @@ def test_unknown_models_fall_back_to_a_small_window():
 
 
 def test_provider_prefixed_model_names_still_resolve():
-    window, source = context_window_for("groq/qwen/qwen3.8-27b")
-    assert window == 131_042
+    window, source = context_window_for(f"vendor/{TEST_MODEL}")
+    assert window == TEST_MODEL_WINDOW
     assert "suffix" in source
 
 
@@ -225,7 +224,7 @@ def test_calibration_ignores_wild_outliers():
 
 
 def test_budget_reserves_output_system_and_margin():
-    budget = build_budget("qwen/qwen3.8-27b", "system " * 500, 4096)
+    budget = build_budget(TEST_MODEL, "system " * 500, 4096)
     assert budget.available_for_input < budget.context_window
     assert budget.reserved_for_output == 4096
     assert budget.reserved_for_system > 0
@@ -336,14 +335,14 @@ def _big_log(lines: int) -> str:
 
 def test_small_input_is_sent_whole():
     ir = parse_logs(SAMPLES["log-rca"]["content"])
-    plan = plan_context(ir, build_budget("qwen/qwen3.8-27b", "sys", 4096))
+    plan = plan_context(ir, build_budget(TEST_MODEL, "sys", 4096))
     assert plan.strategy == "full"
     assert len(plan.chunks) == 1
 
 
 def test_large_input_is_compressed_rather_than_truncated():
     ir = parse_logs(_big_log(40_000))
-    plan = plan_context(ir, build_budget("qwen/qwen3.8-27b", "sys", 4096))
+    plan = plan_context(ir, build_budget(TEST_MODEL, "sys", 4096))
     assert plan.strategy == "summary"
     assert plan.estimated_input_tokens <= plan.budget.available_for_input
     # Compression must preserve the fact that 40k lines existed.
@@ -424,7 +423,7 @@ def test_full_coverage_is_preferred_over_a_cheaper_lossy_plan():
     """
     ir = parse_logs(_varied_log(600))
     plan = plan_context(
-        ir, build_budget("qwen/qwen3.8-27b", "sys", 2_200, token_allowance_per_minute=8_000)
+        ir, build_budget(TEST_MODEL, "sys", 2_200, token_allowance_per_minute=8_000)
     )
     assert plan.strategy == "map_reduce", (
         f"a 600-line log that fits in {len(plan.chunks)} parts was reduced instead of read"
@@ -440,7 +439,7 @@ def test_selection_is_the_fallback_when_full_coverage_is_unaffordable():
     """Degrade with the arithmetic shown, rather than refuse outright."""
     ir = parse_logs(_varied_log(20_000))
     plan = plan_context(
-        ir, build_budget("qwen/qwen3.8-27b", "sys", 2_200, token_allowance_per_minute=8_000)
+        ir, build_budget(TEST_MODEL, "sys", 2_200, token_allowance_per_minute=8_000)
     )
     assert plan.strategy == "selected"
     assert plan.estimated_calls == 1
@@ -463,7 +462,7 @@ def test_a_uniform_huge_log_resolves_to_one_call_inside_the_budget():
     """
     ir = parse_logs(_big_log(60_000))
     plan = plan_context(
-        ir, build_budget("qwen/qwen3.8-27b", "sys", 1024, token_allowance_per_minute=8000)
+        ir, build_budget(TEST_MODEL, "sys", 1024, token_allowance_per_minute=8000)
     )
     assert plan.strategy in {"summary", "selected"}
     assert plan.estimated_calls == 1
@@ -475,7 +474,7 @@ def test_a_uniform_huge_log_resolves_to_one_call_inside_the_budget():
 def test_the_plan_is_explained_in_plain_language():
     """The caller is entitled to know their input was reduced and by what rule."""
     ir = parse_logs(_big_log(40_000))
-    plan = plan_context(ir, build_budget("qwen/qwen3.8-27b", "sys", 1024, token_allowance_per_minute=8000))
+    plan = plan_context(ir, build_budget(TEST_MODEL, "sys", 1024, token_allowance_per_minute=8000))
     description = plan.describe()
     assert "PROCESSING PLAN" in description
     assert "Budget:" in description
@@ -486,7 +485,7 @@ def test_the_budget_is_capped_by_the_token_allowance():
     """A 131k context window on an 8k/min account is not a 131k budget."""
     from backend.prompts import TOOL_PROMPTS
 
-    generous = build_budget("qwen/qwen3.8-27b", TOOL_PROMPTS["log-rca"], 4096)
+    generous = build_budget(TEST_MODEL, TOOL_PROMPTS["log-rca"], 4096)
     limited = build_budget(
         "qwen/qwen3.8-27b", TOOL_PROMPTS["log-rca"], 4096, token_allowance_per_minute=8000
     )

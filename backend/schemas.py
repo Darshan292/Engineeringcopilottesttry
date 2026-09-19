@@ -15,7 +15,7 @@ class ToolRequest(BaseModel):
     input: str = Field(..., description="Raw text pasted by the user.")
     model: str | None = Field(
         default=None,
-        description="Optional per-request model override. Falls back to LLM_MODEL (or GROQ_MODEL).",
+        description="Optional per-request model override. Falls back to LLM_MODEL (or LLM_MODEL).",
     )
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
 

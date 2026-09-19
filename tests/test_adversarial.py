@@ -329,7 +329,7 @@ def test_a_plan_that_would_take_too_long_is_refused_with_the_arithmetic(client, 
 def test_a_non_chat_model_is_refused_by_name(client, for_tool, patch_settings):
     """The provider lists classifiers and speech models; selecting one must
     fail immediately with something actionable, not deep in the planner."""
-    patch_settings(groq_model="meta-llama/llama-prompt-guard-2-86m")
+    patch_settings(model="meta-llama/llama-prompt-guard-2-86m")
     for_tool("log-rca")
 
     res = client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
@@ -345,7 +345,7 @@ def test_a_too_small_context_window_is_refused_by_name(client, for_tool, patch_s
 
     monkeypatch.setitem(tokens.CONTEXT_WINDOWS, "tiny-chat-model", 512)
     monkeypatch.setattr(tokens, "registry", tokens.ModelRegistry())
-    patch_settings(groq_model="tiny-chat-model")
+    patch_settings(model="tiny-chat-model")
     for_tool("log-rca")
 
     res = client.post("/api/log-rca", json={"input": LOG_RCA_SAMPLE})
@@ -353,12 +353,17 @@ def test_a_too_small_context_window_is_refused_by_name(client, for_tool, patch_s
     body = res.json()
     assert "512-token context window" in body["error"]
     assert "too small" in body["error"]
-    # The remedy must name models that actually work.
-    assert "gpt-oss" in body["hint"] or "qwen" in body["hint"]
+    # The remedy must be actionable. It used to name specific models, which is
+    # no longer possible or honest: free ids are withdrawn without notice, so a
+    # list compiled in here would eventually recommend something that 404s.
+    # Point at the live catalogue and the command that filters it instead.
+    assert "LLM_MODEL" in body["hint"]
+    assert "/api/models" in body["hint"] or "list_models" in body["hint"]
+    assert "6,000" in body["hint"], "the hint should say how much window is actually needed"
 
 
 def test_the_token_budget_sheds_before_spending_upstream_quota(client, for_tool, monkeypatch):
-    """Groq's free tier binds on tokens per minute, not requests per minute."""
+    """A token-rationed tier binds on tokens per minute, not requests per minute."""
     from backend import governance
 
     stub = for_tool("log-rca")

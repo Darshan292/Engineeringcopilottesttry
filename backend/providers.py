@@ -4,27 +4,28 @@ Every provider in this space speaks the same chat-completions wire format, which
 is why the client is a thin POST. What they do *not* agree on is everything
 around the edges of a request, and those edges are where the failures live:
 
-- **How they say "come back later".** Groq sends `retry-after` and states the
-  delay in the error body. OpenRouter's free-tier 429 sends neither, and
-  communicates the moment the window reopens as `X-RateLimit-Reset` -- a Unix
-  timestamp in milliseconds, not a duration. Reading one as the other is not a
-  small bug: a timestamp parsed as seconds is a sleep of roughly fifty thousand
-  years.
-- **What they actually ration.** Groq's free tier binds on tokens per minute.
-  OpenRouter's binds on *requests* per minute and per day, and does not report a
-  token ceiling at all. Budgeting a request-limited provider against a token
+- **How they say "come back later".** Some send `retry-after` as a duration.
+  OpenRouter's free-tier 429 often sends neither that nor a delay in the body,
+  and communicates the moment the window reopens as `X-RateLimit-Reset` -- a
+  Unix timestamp in milliseconds. Reading one as the other is not a small bug:
+  a millisecond timestamp parsed as a duration is a sleep of roughly fifty
+  thousand years, so `seconds_until_reset` sanity-checks the magnitude rather
+  than trusting the profile's flag.
+- **What they actually ration.** Some ration tokens per minute. OpenRouter's
+  free tier rations *requests* per minute and per day and reports no token
+  ceiling at all. Budgeting a request-limited provider against a token
   allowance produces refusals that have nothing to do with the real limit.
 - **What their model list looks like.** The same field is `context_window` in
   one and `context_length` in another, sometimes nested under `top_provider`.
 
-Hardcoding any of this to one vendor is how the application ended up telling a
-user their 131,072-token model had no room for input. A profile makes the
-differences data, so adding a third provider is a table entry rather than a
-hunt through the client.
+Hardcoding any of this to one vendor is how this application once told a user
+their 131,072-token model had no room for input. A profile makes the differences
+data, so a new endpoint is a table entry rather than a hunt through the client.
 
-Selection is by `LLM_PROVIDER`, else inferred from the base URL's host, else
-Groq for backwards compatibility. Nothing here is a hard block: an unrecognised
-endpoint gets the conservative generic profile and still works.
+OpenRouter is the provider this application is built around and the default.
+`generic` exists for an OpenAI-compatible server you run yourself -- Ollama,
+llama.cpp, vLLM, LM Studio -- and assumes nothing about rationing. Selection is
+by `LLM_PROVIDER`, else inferred from the base URL's host, else OpenRouter.
 """
 
 from __future__ import annotations
@@ -85,25 +86,6 @@ class Provider:
         }
 
 
-GROQ = Provider(
-    name="groq",
-    label="Groq",
-    base_url="https://api.groq.com/openai/v1",
-    key_envs=("GROQ_API_KEY", "LLM_API_KEY"),
-    console_keys_url="https://console.groq.com/keys",
-    reset_header="x-ratelimit-reset-tokens",
-    reset_is_absolute=False,
-    token_limit_header="x-ratelimit-limit-tokens",
-    # Groq's free tier is generous on requests and tight on tokens, so the
-    # token budget is the one that actually binds.
-    default_requests_per_minute=20,
-    default_requests_per_day=500,
-    default_tokens_per_minute=8_000,
-    default_tokens_per_day=200_000,
-    blind_retry_seconds=10.0,
-    model_hint="Open GET /api/models to see what your key can call, then set LLM_MODEL in .env.",
-)
-
 OPENROUTER = Provider(
     name="openrouter",
     label="OpenRouter",
@@ -147,7 +129,7 @@ GENERIC = Provider(
     name="generic",
     label="OpenAI-compatible endpoint",
     base_url="http://127.0.0.1:11434/v1",
-    key_envs=("LLM_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"),
+    key_envs=("LLM_API_KEY", "OPENROUTER_API_KEY"),
     console_keys_url="",
     reset_header=None,
     reset_is_absolute=False,
@@ -157,21 +139,20 @@ GENERIC = Provider(
     default_tokens_per_minute=0,
     default_tokens_per_day=0,
     blind_retry_seconds=15.0,
-    model_hint="Check that GROQ_BASE_URL/LLM_BASE_URL points at an OpenAI-compatible server.",
+    model_hint="Check that LLM_BASE_URL points at an OpenAI-compatible server.",
 )
 
-PROVIDERS: dict[str, Provider] = {p.name: p for p in (GROQ, OPENROUTER, GENERIC)}
+PROVIDERS: dict[str, Provider] = {p.name: p for p in (OPENROUTER, GENERIC)}
 
 # Host fragment -> provider, for inferring from a base URL alone.
 _HOST_HINTS: tuple[tuple[str, Provider], ...] = (
     ("openrouter.ai", OPENROUTER),
-    ("api.groq.com", GROQ),
 )
 
 
 def _configured_base_url() -> str | None:
     """The base URL the operator set, under any of the accepted names."""
-    for name in ("LLM_BASE_URL", "GROQ_BASE_URL", "OPENAI_BASE_URL"):
+    for name in ("LLM_BASE_URL", "OPENAI_BASE_URL"):
         raw = os.getenv(name)
         if raw and raw.strip():
             return raw.strip().rstrip("/")
@@ -181,8 +162,8 @@ def _configured_base_url() -> str | None:
 def detect_provider(base_url: str | None = None) -> Provider:
     """Which provider profile applies.
 
-    Explicit `LLM_PROVIDER` wins, then the base URL's host, then Groq -- which
-    is what every existing `.env` in the wild is pointed at.
+    Explicit `LLM_PROVIDER` wins, then the base URL's host, then OpenRouter,
+    which is what this application is built around.
     """
     named = (os.getenv("LLM_PROVIDER") or "").strip().lower()
     if named in PROVIDERS:
@@ -194,10 +175,11 @@ def detect_provider(base_url: str | None = None) -> Provider:
         for fragment, provider in _HOST_HINTS:
             if host == fragment or host.endswith("." + fragment):
                 return provider
-        # A URL that matches nothing known is not Groq, whatever the default.
+        # A URL pointing somewhere unrecognised gets the conservative profile
+        # rather than OpenRouter's, whose rate-limit shapes would be wrong.
         if host:
             return GENERIC
-    return GROQ
+    return OPENROUTER
 
 
 def resolve_base_url(provider: Provider) -> str:
